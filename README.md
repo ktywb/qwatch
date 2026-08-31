@@ -100,3 +100,7 @@ for display and never affects flow detection, task status, or session grouping.
 
 Terminal resizes redraw immediately from the cached snapshot and do not trigger
 extra SQLite or `/proc` sampling.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
