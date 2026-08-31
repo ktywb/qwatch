@@ -59,21 +59,28 @@ Quartus release, especially across major-version changes.
 Run from the Quartus project root:
 
 ```console
-python3 /path/to/qwatch.py PROJECT [INTERVAL] [LOG_OR_AUTO] [LOG_LINES]
+python3 /path/to/qwatch.py [OPTIONS]
 ```
 
 For example:
 
 ```console
-python3 /path/to/qwatch.py vpart_pcie 1
+python3 /path/to/qwatch.py
 ```
 
 Useful options:
 
 ```text
---root PATH         Quartus project root (default: current directory)
---stitch-gap SEC    Maximum gap between linked Quartus invocations (default: 60)
+--root PATH          Quartus project root (default: current directory)
+--project NAME       Override the automatically detected display name
+--interval SEC       Refresh interval (default: 1)
+--log PATH|auto      Enable the optional build-log view
+--lines COUNT        Maximum displayed message/log lines (default: 20)
+--stitch-gap SEC     Maximum gap between linked Quartus invocations (default: 60)
 ```
+
+The displayed project name is inferred from the active compiler database, a
+single `.qpf` in the project root, or finally the root-directory name.
 
 Keys:
 
@@ -89,14 +96,14 @@ The default UI displays Quartus `.qmsgdb` messages only. To enable the optional
 build-log view, pass a log path explicitly:
 
 ```console
-python3 /path/to/qwatch.py vpart_pcie 1 path/to/build.log 20
+python3 /path/to/qwatch.py --log path/to/build.log --lines 20
 ```
 
 Passing `auto` enables a convenience fallback that selects the newest
 `logs/*.latest.log` file:
 
 ```console
-python3 /path/to/qwatch.py vpart_pcie 1 auto 20
+python3 /path/to/qwatch.py --log auto --lines 20
 ```
 
 This naming convention is not provided by Quartus. The build log is used only
@@ -104,6 +111,9 @@ for display and never affects flow detection, task status, or session grouping.
 
 Terminal resizes redraw immediately from the cached snapshot and do not trigger
 extra SQLite or `/proc` sampling.
+
+`qwatch` requires an interactive stdin and stdout. Redirected output is rejected
+instead of emitting an unbounded stream of ANSI screen updates.
 
 ## License
 

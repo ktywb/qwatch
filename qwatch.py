@@ -118,7 +118,7 @@ class ProcSnapshot:
     alive_pids: set[int]
     qsys_elapsed: int | None
     qmsg_paths: list[Path]
-    project_tool_start: int | None
+    project_tool_starts: tuple[int, ...]
 
 
 def clip(text: str, columns: int) -> str:
@@ -826,7 +826,7 @@ class ProcSampler:
             rows=sorted(rows, key=lambda row: row.cpu, reverse=True),
             alive_pids=set(stats), qsys_elapsed=qsys_elapsed,
             qmsg_paths=list(dict.fromkeys(qmsg_paths)),
-            project_tool_start=min(project_tool_starts, default=None),
+            project_tool_starts=tuple(sorted(set(project_tool_starts))),
         )
 
 
@@ -862,10 +862,12 @@ class Terminal:
 
 
 class QWatch:
-    def __init__(self, root: Path, project: str, interval: float, log: str | None,
+    def __init__(self, root: Path, project: str | None, interval: float, log: str | None,
                  log_lines: int, stitch_gap: int = 60) -> None:
         self.root = root.resolve()
-        self.project = project
+        qpf_files = sorted(self.root.glob("*.qpf"))
+        self.project_override = project
+        self.project = project or (qpf_files[0].stem if len(qpf_files) == 1 else self.root.name)
         self.interval = max(0.2, interval)
         self.stitch_gap = max(0, stitch_gap)
         self.reader = RunlogReader(self.root)
@@ -986,6 +988,14 @@ class QWatch:
                   if row.status == "running" and row.process_id > 0}
         proc_snapshot = self.procs.snapshot(active, self.root)
         current_identity = self.reader.identity
+        if self.project_override is None and self.reader.path is not None:
+            try:
+                compiler_relative = self.reader.path.relative_to(
+                    self.root / "qdb" / "_compiler"
+                )
+                self.project = compiler_relative.parts[0]
+            except (ValueError, IndexError):
+                pass
         identity_lost = previous_identity is not None and current_identity is None
         identity_changed = (previous_identity is not None and current_identity is not None
                             and previous_identity != current_identity)
@@ -993,20 +1003,19 @@ class QWatch:
                        if row.status == "running" and row.process_id > 0}
         old_run_alive = bool(running_ids & proc_snapshot.alive_pids)
         activity = self.newest_activity(sampled_rows)
-        tool_started_new_generation = bool(
-            proc_snapshot.project_tool_start is not None
-            and proc_snapshot.project_tool_start > activity + 1
-            and not old_run_alive
-        )
+        new_tool_starts = [started for started in proc_snapshot.project_tool_starts
+                           if started > activity + 1]
+        new_tool_start = min(new_tool_starts, default=None)
+        tool_started_new_generation = bool(new_tool_start is not None and not old_run_alive)
         if identity_lost:
-            self.begin_generation(proc_snapshot.project_tool_start or int(time.time()),
+            self.begin_generation(new_tool_start or int(time.time()),
                                   "runlog reset")
         elif identity_changed:
             root = self.latest_root(rows)
             self.begin_generation(root.start_time if root is not None else int(time.time()),
                                   "new runlog")
         elif tool_started_new_generation:
-            self.begin_generation(proc_snapshot.project_tool_start or int(time.time()),
+            self.begin_generation(new_tool_start or int(time.time()),
                                   "new Quartus process")
         self.runlog_identity = current_identity
 
@@ -1215,7 +1224,7 @@ class QWatch:
         screen.append(self.task_line("SYN", "syn", width, "  "))
         fit_status, fit_percent, fit_elapsed = self.fit_status()
         if fit_status:
-            screen.append(self.row("FIT", progress_bar(fit_percent, width, self.tick, False), f"{fit_percent:3d}", fit_status, fit_elapsed, width))
+            screen.append(self.row("FIT (est.)", progress_bar(fit_percent, width, self.tick, False), f"{fit_percent:3d}", fit_status, fit_elapsed, width))
         else:
             screen.append(self.row("FIT", "-", "-", "", -1, width))
         for label, key in (("PLAN", "plan"), ("PLACE", "place"), ("ROUTE", "route"),
@@ -1317,12 +1326,13 @@ class QWatch:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("project", nargs="?", default=Path.cwd().name, help="project name displayed in the UI")
-    parser.add_argument("interval", nargs="?", default=1.0, type=float, help="refresh interval in seconds")
-    parser.add_argument("log", nargs="?", default=None,
-                        help="optional build-log path, or 'auto' for logs/*.latest.log")
-    parser.add_argument("log_lines", nargs="?", default=20, type=int, help="maximum displayed log lines")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="project root (default: cwd)")
+    parser.add_argument("--project", help="display-name override (default: infer from Quartus project)")
+    parser.add_argument("--interval", default=1.0, type=float, help="refresh interval in seconds (default: 1)")
+    parser.add_argument("--log", default=None,
+                        help="optional build-log path, or 'auto' for logs/*.latest.log")
+    parser.add_argument("--lines", dest="log_lines", default=20, type=int,
+                        help="maximum displayed message/log lines (default: 20)")
     parser.add_argument("--stitch-gap", type=int, default=60,
                         help="maximum seconds between adjacent Quartus invocations (default: 60)")
     return parser.parse_args()
@@ -1332,6 +1342,8 @@ def main() -> int:
     args = parse_args()
     if args.interval <= 0 or args.log_lines <= 0 or args.stitch_gap < 0:
         raise SystemExit("interval/log_lines must be positive and stitch-gap must be non-negative")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise SystemExit("qwatch requires an interactive terminal")
     try:
         QWatch(args.root, args.project, args.interval, args.log, args.log_lines, args.stitch_gap).run()
     except KeyboardInterrupt:
