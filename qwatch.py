@@ -1007,7 +1007,10 @@ class QWatch:
                            if started > activity + 1]
         new_tool_start = min(new_tool_starts, default=None)
         tool_started_new_generation = bool(new_tool_start is not None and not old_run_alive)
-        if identity_lost:
+        # Quartus may briefly replace or hide runlog.db while a compiler
+        # process is still alive.  Keep the cached session in that case;
+        # disappearance is a generation boundary only after the old run dies.
+        if identity_lost and not old_run_alive:
             self.begin_generation(new_tool_start or int(time.time()),
                                   "runlog reset")
         elif identity_changed:
@@ -1021,8 +1024,14 @@ class QWatch:
 
         root = self.latest_root(rows)
         if root is not None:
+            live_runlog = any(
+                row.status == "running" and row.process_id > 0
+                and row.process_id in proc_snapshot.alive_pids
+                for row in rows
+            )
             new_enough = (not self.pending_generation_start
-                          or root.start_time >= self.pending_generation_start - 10)
+                          or root.start_time >= self.pending_generation_start - 10
+                          or live_runlog)
             if new_enough:
                 self.adopt_rows(rows, root)
 
