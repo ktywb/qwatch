@@ -89,6 +89,14 @@ class Task:
     hostname: str
 
 
+@dataclass(frozen=True)
+class Checkpoint:
+    stage: str
+    mtime: int
+    predecessor_stage: str
+    predecessor_mtime: int
+
+
 @dataclass
 class ProcRow:
     pid: int
@@ -190,6 +198,7 @@ class RunlogReader:
         self.root = root
         self.path: Path | None = None
         self.last_error = ""
+        self.checkpoints: dict[str, Checkpoint] = {}
 
     def find(self) -> Path | None:
         matches = [Path(path) for path in glob.glob(
@@ -224,7 +233,69 @@ class RunlogReader:
             self.last_error = str(error)
             return []
         self.last_error = ""
+        self.read_checkpoints()
         return [Task(*row) for row in rows]
+
+    def read_checkpoints(self) -> None:
+        self.checkpoints = {}
+        if self.path is None:
+            return
+        version_dir = self.path.parents[2]
+        raw: dict[str, tuple[int, str]] = {}
+        for meta in version_dir.glob("*/[0-9]*/state.meta"):
+            try:
+                data = json.loads(meta.read_text())
+                if data.get("validity") != "LEGAL_STATE":
+                    continue
+                mtime = int(meta.stat().st_mtime)
+                predecessor_parts = str(data.get("predecessor", "")).rstrip("/").split("/")
+                predecessor = predecessor_parts[-2] if len(predecessor_parts) >= 2 else ""
+            except (OSError, ValueError, TypeError, IndexError, AttributeError):
+                continue
+            stage = meta.parent.parent.name
+            if stage not in raw or mtime > raw[stage][0]:
+                raw[stage] = (mtime, predecessor)
+        for stage, (mtime, predecessor) in raw.items():
+            predecessor_mtime = raw.get(predecessor, (mtime, ""))[0]
+            self.checkpoints[stage] = Checkpoint(stage, mtime, predecessor, predecessor_mtime)
+
+    @staticmethod
+    def checkpoint_stage_for_task(name: str) -> str:
+        return {
+            "Analysis & Synthesis": "synthesized",
+            "Analysis & Elaboration": "partitioned",
+            "Synthesis": "synthesized",
+            "Plan": "planned",
+            "Place": "placed",
+            "Route": "routed",
+            "Fast Forward": "fastforward",
+            "Retime": "retimed",
+            "Fitter (Finalize)": "final",
+        }.get(name, "")
+
+    def task_has_checkpoint(self, task: Task, tolerance: int = 60) -> bool:
+        stage = self.checkpoint_stage_for_task(task.name)
+        checkpoint = self.checkpoints.get(stage)
+        return bool(
+            checkpoint and task.status == "done" and task.success and task.checkpoint
+            and task.end_time > 0 and abs(checkpoint.mtime - task.end_time) <= tolerance
+        )
+
+    def synthetic_task(self, key: str, run_name: str) -> Task | None:
+        stage = {
+            "plan": "planned", "place": "placed", "route": "routed",
+            "fast": "fastforward", "retime": "retimed", "finalize": "final",
+        }.get(key, "")
+        checkpoint = self.checkpoints.get(stage)
+        if checkpoint is None:
+            return None
+        start = min(checkpoint.mtime, checkpoint.predecessor_mtime)
+        return Task(
+            -1, TASK_LABELS[key], run_name, 100, "done", start,
+            checkpoint.mtime, checkpoint.mtime,
+            max(0, checkpoint.mtime - start), 0, 0, 1,
+            "done", 1, 0, 0, "",
+        )
 
     def has_synthesis_checkpoint(self, producer: Task, maximum_gap: int) -> bool:
         if self.path is None or not producer.checkpoint:
@@ -774,6 +845,8 @@ class QWatch:
         self.proc_rows: list[ProcRow] = []
         self.session_start = 0
         self.invocation_start = 0
+        self.invocation_root_name = ""
+        self.message_start = 0
         self.session_run_name = ""
         self.fit_last_percent = -1
         self.paused = False
@@ -792,26 +865,24 @@ class QWatch:
 
     def task(self, key: str) -> Task | None:
         label = TASK_LABELS[key]
-        matches = [row for row in self.rows if row.name == label]
+        current = self.session_rows()
+        matches = [row for row in current if row.name == label]
         if key == "fitter":
-            matches = [row for row in self.rows if row.name in {"Fitter", "Fitter (Partial)"}]
+            matches = [row for row in current if row.name in {"Fitter", "Fitter (Partial)"}]
         if not matches:
-            return None
-        if not self.session_start:
-            return max(matches, key=lambda row: (row.start_time, row.last_updated, row.id))
-        allowed = [row for row in matches
-                   if row.run_name == self.session_run_name
-                   and (row.start_time >= self.session_start
-                        or (row.status == "scheduled" and row.last_updated >= self.session_start))]
-        return max(allowed, key=lambda row: (row.start_time, row.last_updated, row.id), default=None)
+            return (self.reader.synthetic_task(key, self.session_run_name)
+                    if self.invocation_root_name == "Flow" else None)
+        return max(matches, key=lambda row: (row.start_time, row.last_updated, row.id))
 
     def session_rows(self) -> list[Task]:
         if not self.session_start:
             return []
         return [row for row in self.rows
                 if row.run_name == self.session_run_name
-                and (row.start_time >= self.session_start
-                     or (row.status == "scheduled" and row.last_updated >= self.session_start))]
+                and (row.start_time >= self.invocation_start
+                     or (row.status == "scheduled" and row.last_updated >= self.invocation_start)
+                     or (self.invocation_root_name == "Flow"
+                         and self.reader.task_has_checkpoint(row)))]
 
     def refresh(self) -> None:
         rows = self.reader.read()
@@ -830,11 +901,16 @@ class QWatch:
                          or session_start != self.session_start)):
                 self.session_run_name = root.run_name
                 self.invocation_start = root.start_time
+                self.invocation_root_name = root.name
                 self.session_start = session_start
                 self.fit_last_percent = -1
-                database_dir = self.reader.path.parent if self.reader.path is not None else None
-                self.messages.set_session(self.session_start, database_dir)
             self.rows = rows
+            visible_starts = [row.start_time for row in self.session_rows() if row.start_time > 0]
+            message_start = min(visible_starts, default=self.session_start)
+            if message_start != self.message_start:
+                self.message_start = message_start
+                database_dir = self.reader.path.parent if self.reader.path is not None else None
+                self.messages.set_session(self.message_start, database_dir)
         self.tailer.refresh()
         current = self.session_rows()
         active = {row.process_id for row in current if row.status == "running" and row.process_id > 0}
@@ -894,8 +970,9 @@ class QWatch:
                 progress += weight
             elif task.status == "running":
                 progress += weight * max(0, min(100, task.percent)) / 100.0
-            if task.elapsed_time > 0:
-                elapsed += task.elapsed_time
+            stage_elapsed = self.task_status(key)[2]
+            if stage_elapsed > 0:
+                elapsed += stage_elapsed
         percent = int(round(progress * 100.0 / weight_total))
         if status == "done":
             percent = 100
@@ -903,7 +980,9 @@ class QWatch:
             percent = 99
         percent = max(percent, self.fit_last_percent)
         self.fit_last_percent = percent
-        if parent is not None and parent.start_time:
+        child_starts = [task.start_time for task in children if task is not None and task.start_time > 0]
+        if (parent is not None and parent.start_time
+                and (not child_starts or parent.start_time <= min(child_starts))):
             elapsed = (int(time.time()) - parent.start_time
                        if parent.status == "running" else parent.elapsed_time)
         return status, percent, elapsed if elapsed else -1
@@ -912,11 +991,13 @@ class QWatch:
         if not self.session_start:
             return -1
         current = self.session_rows()
+        starts = [row.start_time for row in current if row.start_time > 0]
+        start = min(starts, default=self.session_start)
         ends = [row.end_time for row in current if row.end_time > 0]
         end = max(ends, default=int(time.time()))
         if any(row.status == "running" for row in current):
             end = int(time.time())
-        return max(0, end - self.session_start)
+        return max(0, end - start)
 
     def update_qsys_status(self, elapsed: int | None) -> None:
         now = time.time()

@@ -8,7 +8,8 @@ Monitoring Mode without launching an additional `quartus_sh` process.
 
 - `runlog.db`: flow and task status
 - task `.qmsgdb` files: incremental compiler messages
-- `state.meta` and report files: checkpoint/completion events
+- `state.meta`: checkpoint dependency/recovery and completion events
+- report files: completion events
 - `/proc`: CPU, memory, I/O, thread, process and liveness metrics
 - `flow.<run>.heartbeat`: stale-flow detection when available
 
