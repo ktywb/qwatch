@@ -276,7 +276,7 @@ class RunlogReader:
 
 
 class LogTail:
-    def __init__(self, root: Path, requested: str, line_count: int) -> None:
+    def __init__(self, root: Path, requested: str | None, line_count: int) -> None:
         self.root = root
         self.requested = requested
         self.history: deque[str] = deque(maxlen=1000)
@@ -287,11 +287,15 @@ class LogTail:
         self.view_offset = 0
         self.line_count = line_count
 
+    @property
+    def enabled(self) -> bool:
+        return self.requested is not None
+
     def select_auto(self) -> Path | None:
         selected: Path | None = None
         selected_mtime = -1.0
         log_dir = self.root / "logs"
-        for latest in log_dir.glob("hw-*.latest.log"):
+        for latest in log_dir.glob("*.latest.log"):
             try:
                 mtime = latest.stat().st_mtime
             except OSError:
@@ -301,6 +305,8 @@ class LogTail:
         return selected
 
     def wanted_path(self) -> Path | None:
+        if self.requested is None:
+            return None
         if self.requested == "auto":
             return self.select_auto()
         path = Path(self.requested)
@@ -753,7 +759,7 @@ class Terminal:
 
 
 class QWatch:
-    def __init__(self, root: Path, project: str, interval: float, log: str,
+    def __init__(self, root: Path, project: str, interval: float, log: str | None,
                  log_lines: int, stitch_gap: int = 60) -> None:
         self.root = root.resolve()
         self.project = project
@@ -1051,7 +1057,10 @@ class QWatch:
             screen.extend(("", f"{RED}Status: {clip(self.last_error, columns)}{RESET}"))
         if not compact:
             screen.append("")
-        screen.append("q/Ctrl-C exit  Space pause  +/- rate  ↑/↓ scroll  m messages/log")
+        footer = "q/Ctrl-C exit  Space pause  +/- rate  ↑/↓ scroll"
+        if self.tailer.enabled:
+            footer += "  m messages/log"
+        screen.append(footer)
         clear = CLEAR_SCREEN if self.last_size != (rows, columns) else ""
         self.last_size = (rows, columns)
         rendered = "\n".join(f"{line}{CLEAR_LINE}" for line in screen)
@@ -1089,8 +1098,9 @@ class QWatch:
                 self.interval = min(10.0, self.interval + 0.2)
                 redraw = True
             elif key in {b"m", b"M"}:
-                self.message_mode = not self.message_mode
-                redraw = True
+                if self.tailer.enabled:
+                    self.message_mode = not self.message_mode
+                    redraw = True
         return True, redraw
 
     def run(self) -> None:
@@ -1122,7 +1132,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("project", nargs="?", default=Path.cwd().name, help="project name displayed in the UI")
     parser.add_argument("interval", nargs="?", default=1.0, type=float, help="refresh interval in seconds")
-    parser.add_argument("log", nargs="?", default="auto", help="log path, or auto")
+    parser.add_argument("log", nargs="?", default=None,
+                        help="optional build-log path, or 'auto' for logs/*.latest.log")
     parser.add_argument("log_lines", nargs="?", default=20, type=int, help="maximum displayed log lines")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="project root (default: cwd)")
     parser.add_argument("--stitch-gap", type=int, default=60,
