@@ -172,8 +172,9 @@ def progress_bar(percent: int | None, width: int, tick: int, indeterminate: bool
         return "-"
     if indeterminate:
         block = min(6, max(3, width // 5))
-        start = (tick % (width + block)) - block
-        body = "".join("█" if start <= i < start + block else "░" for i in range(width))
+        start = tick % width
+        occupied = {(start + offset) % width for offset in range(block)}
+        body = "".join("█" if i in occupied else "░" for i in range(width))
         return f"|{body}|"
     value = max(0, min(100, percent or 0))
     filled = int(value * width / 100.0)
