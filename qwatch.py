@@ -44,14 +44,6 @@ CURSOR_HIDE = f"{ESC}?25l"
 CURSOR_SHOW = f"{ESC}?25h"
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-TASK_WEIGHTS = {
-    "plan": 5,
-    "place": 45,
-    "route": 23,
-    "fast": 5,
-    "retime": 6,
-    "finalize": 16,
-}
 TASK_LABELS = {
     "a_s": "Analysis & Synthesis",
     "elab": "Analysis & Elaboration",
@@ -885,7 +877,6 @@ class QWatch:
         self.invocation_root_name = ""
         self.message_start = 0
         self.session_run_name = ""
-        self.fit_last_percent = -1
         self.paused = False
         self.message_mode = True
         self.tick = 0
@@ -946,7 +937,6 @@ class QWatch:
         self.invocation_root_name = ""
         self.message_start = 0
         self.session_run_name = ""
-        self.fit_last_percent = -1
         self.update_age = None
         self.heartbeat_age = None
         self.qsys_started = None
@@ -966,7 +956,6 @@ class QWatch:
             self.invocation_start = root.start_time
             self.invocation_root_name = root.name
             self.session_start = session_start
-            self.fit_last_percent = -1
         self.pending_generation_start = 0
         self.pending_generation_reason = ""
         self.rows = rows
@@ -1066,51 +1055,6 @@ class QWatch:
             elapsed = task.elapsed_time if task.elapsed_time > 0 else -1
         return task.status, task.percent, elapsed
 
-    def fit_status(self) -> tuple[str, int, int]:
-        children = [self.task(key) for key in TASK_WEIGHTS]
-        statuses = [task.status for task in children if task is not None]
-        parent = self.task("fitter")
-        if parent is not None and parent.status == "done":
-            status = "done"
-        elif "running" in statuses or (parent is not None and parent.status == "running"):
-            status = "running"
-        elif "done" in statuses:
-            status = "scheduled"
-        else:
-            return "", 0, -1
-        fast = self.task("fast")
-        later = self.task("retime") or self.task("finalize")
-        skipped_fast = fast is None and later is not None
-        weight_total = 95 if skipped_fast else 100
-        progress = 0.0
-        elapsed = 0
-        for key, weight in TASK_WEIGHTS.items():
-            if skipped_fast and key == "fast":
-                continue
-            task = self.task(key)
-            if task is None:
-                continue
-            if task.status == "done":
-                progress += weight
-            elif task.status == "running":
-                progress += weight * max(0, min(100, task.percent)) / 100.0
-            stage_elapsed = self.task_status(key)[2]
-            if stage_elapsed > 0:
-                elapsed += stage_elapsed
-        percent = int(round(progress * 100.0 / weight_total))
-        if status == "done":
-            percent = 100
-        elif percent >= 100:
-            percent = 99
-        percent = max(percent, self.fit_last_percent)
-        self.fit_last_percent = percent
-        child_starts = [task.start_time for task in children if task is not None and task.start_time > 0]
-        if (parent is not None and parent.start_time
-                and (not child_starts or parent.start_time <= min(child_starts))):
-            elapsed = (int(time.time()) - parent.start_time
-                       if parent.status == "running" else parent.elapsed_time)
-        return status, percent, elapsed if elapsed else -1
-
     def total_elapsed(self) -> int:
         if not self.session_start:
             return -1
@@ -1157,6 +1101,19 @@ class QWatch:
         value = None if indeterminate else percent
         return self.row(f"{indent}{label}", progress_bar(value, width, self.tick, indeterminate),
                         "-" if indeterminate else f"{percent:3d}", status, elapsed, width)
+
+    def parent_task_line(self, label: str, key: str, width: int) -> str:
+        """Render a native Quartus parent whose running percent is undefined."""
+        status, _, elapsed = self.task_status(key)
+        if not status:
+            return self.row(label, "-", "-", "", -1, width)
+        if status == "running":
+            return self.row(label, progress_bar(None, width, self.tick, True), "-",
+                            status, elapsed, width)
+        if status == "done":
+            return self.row(label, progress_bar(100, width, self.tick, False), "100",
+                            status, elapsed, width)
+        return self.row(label, "-", "-", status, elapsed, width)
 
     @staticmethod
     def row(stage: str, progress: str, percent: str, status: str, elapsed: int, width: int) -> str:
@@ -1231,14 +1188,10 @@ class QWatch:
         screen.append(f"{BOLD}{BLUE}{header}{RESET}")
         qsys_status, qsys_elapsed = self.qsys_snapshot
         screen.append(self.row("QSYS", "-", "-", qsys_status, qsys_elapsed, width))
-        screen.append(self.task_line("A&S", "a_s", width))
+        screen.append(self.parent_task_line("A&S", "a_s", width))
         screen.append(self.task_line("ELAB", "elab", width, "  "))
         screen.append(self.task_line("SYN", "syn", width, "  "))
-        fit_status, fit_percent, fit_elapsed = self.fit_status()
-        if fit_status:
-            screen.append(self.row("FIT (est.)", progress_bar(fit_percent, width, self.tick, False), f"{fit_percent:3d}", fit_status, fit_elapsed, width))
-        else:
-            screen.append(self.row("FIT", "-", "-", "", -1, width))
+        screen.append(self.parent_task_line("FIT", "fitter", width))
         for label, key in (("PLAN", "plan"), ("PLACE", "place"), ("ROUTE", "route"),
                            ("FAST-FWD", "fast"), ("RETIME", "retime"), ("FINALIZE", "finalize")):
             screen.append(self.task_line(label, key, width, "  "))

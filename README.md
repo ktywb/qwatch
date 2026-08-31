@@ -14,6 +14,9 @@ Monitoring Mode without launching an additional `quartus_sh` process.
 - `flow.<run>.heartbeat`: stale-flow detection when available
 
 Build logs are display-only and are never used to determine compilation state.
+The A&S and FIT parent rows use Quartus-native status and elapsed time. Because
+Quartus does not provide a meaningful running percentage for these parent rows,
+qwatch shows an indeterminate bar while their child tasks retain native percent.
 New compilation generations are detected from `runlog.db` replacement and
 project-scoped front-end drivers (`qsys-generate`, `quartus_syn`, `quartus_map`,
 or `quartus_sh --flow`). Fitter, Assembler, and Timing Analyzer processes are
