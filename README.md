@@ -14,6 +14,9 @@ Monitoring Mode without launching an additional `quartus_sh` process.
 - `flow.<run>.heartbeat`: stale-flow detection when available
 
 Build logs are display-only and are never used to determine compilation state.
+New compilation generations are detected from `runlog.db` replacement and
+project-scoped Quartus compiler processes. QSYS activity is shown when present,
+but is optional and is not required for generation detection.
 
 ## Requirements
 

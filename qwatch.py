@@ -118,6 +118,7 @@ class ProcSnapshot:
     alive_pids: set[int]
     qsys_elapsed: int | None
     qmsg_paths: list[Path]
+    project_tool_start: int | None
 
 
 def clip(text: str, columns: int) -> str:
@@ -197,6 +198,7 @@ class RunlogReader:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.path: Path | None = None
+        self.identity: tuple[int, int] | None = None
         self.last_error = ""
         self.checkpoints: dict[str, Checkpoint] = {}
 
@@ -212,9 +214,16 @@ class RunlogReader:
         path = self.find()
         if path is None:
             self.path = None
+            self.identity = None
+            self.checkpoints = {}
             self.last_error = "runlog.db not found; start a Quartus compilation first"
             return []
         self.path = path
+        try:
+            stamp = path.stat()
+            self.identity = (stamp.st_dev, stamp.st_ino)
+        except OSError:
+            self.identity = None
         uri = f"file:{path}?mode=ro"
         try:
             connection = sqlite3.connect(uri, uri=True, timeout=0.2)
@@ -630,6 +639,11 @@ class EventWatcher:
         self.events: deque[str] = deque(maxlen=20)
         self.initialized = False
 
+    def reset(self) -> None:
+        self.known.clear()
+        self.events.clear()
+        self.initialized = False
+
     def refresh(self, runlog_path: Path | None) -> None:
         paths: list[Path] = []
         if runlog_path is not None and len(runlog_path.parents) >= 3:
@@ -739,6 +753,7 @@ class ProcSampler:
     def snapshot(self, active_pids: set[int], root: Path) -> ProcSnapshot:
         now = time.monotonic()
         uptime = float(Path("/proc/uptime").read_text().split()[0])
+        boot_time = time.time() - uptime
         stats: dict[int, tuple[int, str, int, int, int, int, str]] = {}
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
@@ -756,12 +771,28 @@ class ProcSampler:
         current: dict[int, tuple[int, int, int, float]] = {}
         qsys_elapsed: int | None = None
         qmsg_paths: list[Path] = []
+        project_tool_starts: list[int] = []
         for pid, stat in stats.items():
             name = stat[6]
-            if "qsys" not in name.lower():
-                continue
-            command = self.read_cmdline(pid)
-            if "qsys-generate" in command and str(root) in command:
+            command = ""
+            is_project_tool = False
+            if "qsys" in name.lower():
+                command = self.read_cmdline(pid)
+                is_project_tool = "qsys-generate" in command and str(root) in command
+            elif name.startswith("quartus"):
+                try:
+                    is_project_tool = Path(f"/proc/{pid}/cwd").resolve() == root
+                except OSError:
+                    is_project_tool = False
+                if is_project_tool:
+                    command = self.read_cmdline(pid)
+                    # Worker processes are born throughout a task; only a
+                    # project-level driver is a stable generation boundary.
+                    if "--ipc_mode" in command or "--ipc_sh" in command:
+                        is_project_tool = False
+            if is_project_tool:
+                project_tool_starts.append(int(boot_time + stat[5] / self.clk_tck))
+            if "qsys" in name.lower() and is_project_tool:
                 elapsed = max(0, int(uptime - stat[5] / self.clk_tck))
                 qsys_elapsed = max(qsys_elapsed or 0, elapsed)
         for pid in included:
@@ -795,6 +826,7 @@ class ProcSampler:
             rows=sorted(rows, key=lambda row: row.cpu, reverse=True),
             alive_pids=set(stats), qsys_elapsed=qsys_elapsed,
             qmsg_paths=list(dict.fromkeys(qmsg_paths)),
+            project_tool_start=min(project_tool_starts, default=None),
         )
 
 
@@ -854,6 +886,9 @@ class QWatch:
         self.tick = 0
         self.last_size: tuple[int, int] | None = None
         self.last_error = ""
+        self.runlog_identity: tuple[int, int] | None = None
+        self.pending_generation_start = 0
+        self.pending_generation_reason = ""
         self.qsys_started: float | None = None
         self.qsys_last_seen = 0.0
         self.qsys_final = -1
@@ -875,7 +910,7 @@ class QWatch:
         return max(matches, key=lambda row: (row.start_time, row.last_updated, row.id))
 
     def session_rows(self) -> list[Task]:
-        if not self.session_start:
+        if self.pending_generation_start or not self.session_start:
             return []
         return [row for row in self.rows
                 if row.run_name == self.session_run_name
@@ -884,37 +919,105 @@ class QWatch:
                      or (self.invocation_root_name == "Flow"
                          and self.reader.task_has_checkpoint(row)))]
 
+    @staticmethod
+    def newest_activity(rows: list[Task]) -> int:
+        return max((max(row.start_time, row.last_updated, row.end_time)
+                    for row in rows), default=0)
+
+    @staticmethod
+    def latest_root(rows: list[Task]) -> Task | None:
+        roots = [row for row in rows if row.name in {"Flow", TASK_LABELS["a_s"]}]
+        return max(roots, key=lambda row: (row.start_time, row.id), default=None)
+
+    def begin_generation(self, start_time: int, reason: str) -> None:
+        start_time = max(1, int(start_time))
+        if self.pending_generation_start == start_time:
+            return
+        self.pending_generation_start = start_time
+        self.pending_generation_reason = reason
+        self.rows = []
+        self.session_start = 0
+        self.invocation_start = 0
+        self.invocation_root_name = ""
+        self.message_start = 0
+        self.session_run_name = ""
+        self.fit_last_percent = -1
+        self.update_age = None
+        self.heartbeat_age = None
+        self.qsys_started = None
+        self.qsys_last_seen = 0.0
+        self.qsys_final = -1
+        self.qsys_snapshot = ("", -1)
+        self.messages.set_session(start_time, None)
+        self.events.reset()
+
+    def adopt_rows(self, rows: list[Task], root: Task) -> None:
+        invocation = (root.run_name, root.start_time)
+        session_start = self.reader.quartus_session_start(rows, root, self.stitch_gap)
+        if (root.start_time
+                and (invocation != (self.session_run_name, self.invocation_start)
+                     or session_start != self.session_start)):
+            self.session_run_name = root.run_name
+            self.invocation_start = root.start_time
+            self.invocation_root_name = root.name
+            self.session_start = session_start
+            self.fit_last_percent = -1
+        self.pending_generation_start = 0
+        self.pending_generation_reason = ""
+        self.rows = rows
+        visible_starts = [row.start_time for row in self.session_rows() if row.start_time > 0]
+        message_start = min(visible_starts, default=self.session_start)
+        if message_start != self.message_start:
+            self.message_start = message_start
+            database_dir = self.reader.path.parent if self.reader.path is not None else None
+            self.messages.set_session(self.message_start, database_dir)
+
     def refresh(self) -> None:
+        previous_identity = self.runlog_identity
         rows = self.reader.read()
         self.last_error = self.reader.last_error
-        if rows:
-            # Every flow invocation gets a Flow row.  Keep A&S as a fallback
-            # for older schemas, but do not let an earlier full compile leak
-            # into a newer fit-only/STA-only invocation.
-            roots = [row for row in rows if row.name in {"Flow", TASK_LABELS["a_s"]}]
-            root = max(roots, key=lambda row: (row.start_time, row.id), default=None)
-            invocation = (root.run_name, root.start_time) if root is not None else ("", 0)
-            session_start = (self.reader.quartus_session_start(rows, root, self.stitch_gap)
-                             if root is not None else 0)
-            if (root is not None and root.start_time
-                    and (invocation != (self.session_run_name, self.invocation_start)
-                         or session_start != self.session_start)):
-                self.session_run_name = root.run_name
-                self.invocation_start = root.start_time
-                self.invocation_root_name = root.name
-                self.session_start = session_start
-                self.fit_last_percent = -1
-            self.rows = rows
-            visible_starts = [row.start_time for row in self.session_rows() if row.start_time > 0]
-            message_start = min(visible_starts, default=self.session_start)
-            if message_start != self.message_start:
-                self.message_start = message_start
-                database_dir = self.reader.path.parent if self.reader.path is not None else None
-                self.messages.set_session(self.message_start, database_dir)
         self.tailer.refresh()
-        current = self.session_rows()
-        active = {row.process_id for row in current if row.status == "running" and row.process_id > 0}
+
+        # Sample both the newly read rows and the cached rows.  This lets a
+        # new project-scoped Quartus driver invalidate a stale run before its
+        # replacement runlog.db has been created.
+        sampled_rows = rows or self.rows
+        active = {row.process_id for row in sampled_rows
+                  if row.status == "running" and row.process_id > 0}
         proc_snapshot = self.procs.snapshot(active, self.root)
+        current_identity = self.reader.identity
+        identity_lost = previous_identity is not None and current_identity is None
+        identity_changed = (previous_identity is not None and current_identity is not None
+                            and previous_identity != current_identity)
+        running_ids = {row.process_id for row in sampled_rows
+                       if row.status == "running" and row.process_id > 0}
+        old_run_alive = bool(running_ids & proc_snapshot.alive_pids)
+        activity = self.newest_activity(sampled_rows)
+        tool_started_new_generation = bool(
+            proc_snapshot.project_tool_start is not None
+            and proc_snapshot.project_tool_start > activity + 1
+            and not old_run_alive
+        )
+        if identity_lost:
+            self.begin_generation(proc_snapshot.project_tool_start or int(time.time()),
+                                  "runlog reset")
+        elif identity_changed:
+            root = self.latest_root(rows)
+            self.begin_generation(root.start_time if root is not None else int(time.time()),
+                                  "new runlog")
+        elif tool_started_new_generation:
+            self.begin_generation(proc_snapshot.project_tool_start or int(time.time()),
+                                  "new Quartus process")
+        self.runlog_identity = current_identity
+
+        root = self.latest_root(rows)
+        if root is not None:
+            new_enough = (not self.pending_generation_start
+                          or root.start_time >= self.pending_generation_start - 10)
+            if new_enough:
+                self.adopt_rows(rows, root)
+
+        current = self.session_rows()
         self.proc_rows = proc_snapshot.rows
         self.alive_pids = proc_snapshot.alive_pids
         self.messages.refresh(proc_snapshot.qmsg_paths)
@@ -1003,7 +1106,7 @@ class QWatch:
         now = time.time()
         if elapsed is not None:
             candidate_start = now - elapsed
-            self.qsys_started = candidate_start if self.qsys_started is None else min(
+            self.qsys_started = candidate_start if not self.qsys_last_seen else min(
                 self.qsys_started, candidate_start
             )
             self.qsys_last_seen = now
@@ -1061,6 +1164,9 @@ class QWatch:
         return lines
 
     def health_line(self, columns: int) -> str:
+        if self.pending_generation_start:
+            detail = self.pending_generation_reason or "waiting for runlog"
+            return f"{CYAN}{clip(f'Flow: PREPARING  {detail}', columns)}{RESET}"
         running = [row for row in self.session_rows() if row.status == "running"]
         active = max(running, key=lambda row: (row.last_updated, row.start_time, row.id), default=None)
         if active is None:
