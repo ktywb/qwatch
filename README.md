@@ -15,8 +15,10 @@ Monitoring Mode without launching an additional `quartus_sh` process.
 
 Build logs are display-only and are never used to determine compilation state.
 New compilation generations are detected from `runlog.db` replacement and
-project-scoped Quartus compiler processes. QSYS activity is shown when present,
-but is optional and is not required for generation detection.
+project-scoped front-end drivers (`qsys-generate`, `quartus_syn`, `quartus_map`,
+or `quartus_sh --flow`). Fitter, Assembler, and Timing Analyzer processes are
+treated as stages of that generation. QSYS activity is shown when present, but
+is optional and is not required for generation detection.
 
 ## Requirements
 

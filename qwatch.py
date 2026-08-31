@@ -66,6 +66,7 @@ TASK_LABELS = {
     "asm": "Assembler",
     "sta": "Timing Analysis (Finalize)",
 }
+GENERATION_DRIVERS = {"quartus_syn", "quartus_map"}
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,7 @@ class ProcSnapshot:
     alive_pids: set[int]
     qsys_elapsed: int | None
     qmsg_paths: list[Path]
-    project_tool_starts: tuple[int, ...]
+    generation_driver_starts: tuple[int, ...]
 
 
 def clip(text: str, columns: int) -> str:
@@ -771,7 +772,7 @@ class ProcSampler:
         current: dict[int, tuple[int, int, int, float]] = {}
         qsys_elapsed: int | None = None
         qmsg_paths: list[Path] = []
-        project_tool_starts: list[int] = []
+        generation_driver_starts: list[int] = []
         for pid, stat in stats.items():
             name = stat[6]
             command = ""
@@ -779,19 +780,21 @@ class ProcSampler:
             if "qsys" in name.lower():
                 command = self.read_cmdline(pid)
                 is_project_tool = "qsys-generate" in command and str(root) in command
-            elif name.startswith("quartus"):
+            elif name in GENERATION_DRIVERS or name == "quartus_sh":
                 try:
                     is_project_tool = Path(f"/proc/{pid}/cwd").resolve() == root
                 except OSError:
                     is_project_tool = False
                 if is_project_tool:
                     command = self.read_cmdline(pid)
-                    # Worker processes are born throughout a task; only a
-                    # project-level driver is a stable generation boundary.
-                    if "--ipc_mode" in command or "--ipc_sh" in command:
+                    # Fitter/Assembler/STA are task transitions within one
+                    # compile, not new generations.  quartus_sh is a boundary
+                    # only for an explicit Flow invocation.
+                    if ("--ipc_mode" in command or "--ipc_sh" in command
+                            or (name == "quartus_sh" and "--flow" not in command)):
                         is_project_tool = False
             if is_project_tool:
-                project_tool_starts.append(int(boot_time + stat[5] / self.clk_tck))
+                generation_driver_starts.append(int(boot_time + stat[5] / self.clk_tck))
             if "qsys" in name.lower() and is_project_tool:
                 elapsed = max(0, int(uptime - stat[5] / self.clk_tck))
                 qsys_elapsed = max(qsys_elapsed or 0, elapsed)
@@ -826,7 +829,7 @@ class ProcSampler:
             rows=sorted(rows, key=lambda row: row.cpu, reverse=True),
             alive_pids=set(stats), qsys_elapsed=qsys_elapsed,
             qmsg_paths=list(dict.fromkeys(qmsg_paths)),
-            project_tool_starts=tuple(sorted(set(project_tool_starts))),
+            generation_driver_starts=tuple(sorted(set(generation_driver_starts))),
         )
 
 
@@ -1003,7 +1006,7 @@ class QWatch:
                        if row.status == "running" and row.process_id > 0}
         old_run_alive = bool(running_ids & proc_snapshot.alive_pids)
         activity = self.newest_activity(sampled_rows)
-        new_tool_starts = [started for started in proc_snapshot.project_tool_starts
+        new_tool_starts = [started for started in proc_snapshot.generation_driver_starts
                            if started > activity + 1]
         new_tool_start = min(new_tool_starts, default=None)
         tool_started_new_generation = bool(new_tool_start is not None and not old_run_alive)
