@@ -33,6 +33,8 @@ GREEN = f"{ESC}32m"
 YELLOW = f"{ESC}33m"
 CYAN = f"{ESC}36m"
 GRAY = f"{ESC}37m"
+PROGRESS_GRAY = f"{ESC}38;5;243m"
+FOOTER_GRAY = f"{ESC}38;5;245m"
 RED = f"{ESC}31m"
 CLEAR_LINE = f"{ESC}K"
 CLEAR_BELOW = f"{ESC}J"
@@ -42,6 +44,18 @@ ALT_ENTER = f"{ESC}?1049h"
 ALT_LEAVE = f"{ESC}?1049l"
 CURSOR_HIDE = f"{ESC}?25l"
 CURSOR_SHOW = f"{ESC}?25h"
+
+# ■ 
+black_block = f"■"
+white_block = f" "
+
+# # ━─
+# black_block = f"━"
+# white_block = f"─"
+
+# # █░
+# black_block = f"█"
+# white_block = f"░"
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 TASK_LABELS = {
@@ -167,18 +181,40 @@ def color_status(status: str) -> str:
     return f"{color}{text}{RESET}"
 
 
+# def progress_bar(percent: int | None, width: int, tick: int, indeterminate: bool) -> str:
+#     if width < 1:
+#         return "-"
+#     if indeterminate:
+#         block = min(6, max(3, width // 5))
+#         start = tick % width
+#         occupied = {(start + offset) % width for offset in range(block)}
+#         body = "".join("█" if i in occupied else "░" for i in range(width))
+#         return f"{GRAY}{body}{RESET}  "
+#     value = max(0, min(100, percent or 0))
+#     filled = int(value * width / 100.0)
+#     return f"{GRAY}{'█' * filled}{'░' * (width - filled)}{RESET}  "
 def progress_bar(percent: int | None, width: int, tick: int, indeterminate: bool) -> str:
     if width < 1:
-        return "-"
+        return white_block # "-"
+
     if indeterminate:
         block = min(6, max(3, width // 5))
-        start = tick % width
-        occupied = {(start + offset) % width for offset in range(block)}
-        body = "".join("█" if i in occupied else "░" for i in range(width))
-        return f"|{body}|"
+
+        travel = max(0, width - block)
+        period = max(1, 2 * travel)
+
+        phase = tick % period
+        start = phase if phase <= travel else period - phase
+
+        body = "".join(
+            black_block if start <= i < start + block else white_block
+            for i in range(width)
+        )
+        return f"{PROGRESS_GRAY}{body}{RESET}"
+
     value = max(0, min(100, percent or 0))
     filled = int(value * width / 100.0)
-    return f"|{'█' * filled}{'░' * (width - filled)}|"
+    return f"{PROGRESS_GRAY}{black_block * filled}{white_block * (width - filled)}{RESET}"
 
 
 class RunlogReader:
@@ -1117,8 +1153,17 @@ class QWatch:
         return self.row(label, "-", "-", status, elapsed, width)
 
     @staticmethod
-    def row(stage: str, progress: str, percent: str, status: str, elapsed: int, width: int) -> str:
-        return f"{stage:<12} {progress:<{width + 2}} {percent:>6}   {color_status(status)}  {elapsed_text(elapsed)}"
+    def row(stage: str, progress: str, percent: str,
+            status: str, elapsed: int, width: int) -> str:
+            visible_len = len(ANSI_RE.sub("", progress))
+            progress_pad = " " * max(0, width - visible_len)
+            return (
+                f"{stage:<12} "
+                f"{progress}{progress_pad}"
+                f"  {percent:>3}   "
+                f"{color_status(status)}  "
+                f"{elapsed_text(elapsed)}"
+            )
 
     def process_lines(self, columns: int, maximum: int) -> list[str]:
         wide = columns >= 105
@@ -1178,14 +1223,21 @@ class QWatch:
         heartbeat = "■" if self.tick % 2 else "□"
         mode = "PAUSED" if self.paused else "LIVE"
         mode_color = YELLOW if self.paused else GREEN
-        screen: list[str] = [f"{BOLD}{BLUE}{heartbeat} Quartus Monitor {mode_color}[{mode}]{RESET}  {self.project}  {self.interval:g}s"]
+        # screen: list[str] = [f"{BOLD}{BLUE}{heartbeat} Quartus Monitor {mode_color}[{mode}]{RESET}  {self.project}  {self.interval:g}s"]
+        screen: list[str] = [f"{BOLD}{BLUE}Quartus Monitor {mode_color}[{mode}]{RESET}  {self.project}  {self.interval:g}s"]
         screen.append(self.health_line(columns))
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Processes{RESET}"))
         screen.extend(self.process_lines(columns, process_max))
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Compilation{RESET}"))
-        header = f"{'Stage':<12} {'Progress':<{width + 2}} {'%':>6}   {'Status':<8}  Elapsed"
+        header = (
+                    f"{'Stage':<12} "
+                    f"{'Progress':<{width}}"
+                    f"  {'%':>3}   "
+                    f"{'Status':<8}  "
+                    f"Elapsed"
+                )
         screen.append(f"{BOLD}{BLUE}{header}{RESET}")
         qsys_status, qsys_elapsed = self.qsys_snapshot
         screen.append(self.row("QSYS", "-", "-", qsys_status, qsys_elapsed, width))
@@ -1198,7 +1250,7 @@ class QWatch:
             screen.append(self.task_line(label, key, width, "  "))
         screen.append(self.task_line("ASM", "asm", width))
         screen.append(self.task_line("STA", "sta", width))
-        screen.append(f"{BOLD}{'Total : ' :>{35 + width}}{elapsed_text(self.total_elapsed())}{RESET}")
+        screen.append(f"{BOLD}{'Total : ' :>{31 + width}}{elapsed_text(self.total_elapsed())}{RESET}")
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Events{RESET}"))
             event_lines = list(self.events.events)[-2:] or ["(no new checkpoint/report events)"]
@@ -1222,7 +1274,8 @@ class QWatch:
         footer = "q/Ctrl-C exit  Space pause  +/- rate  ↑/↓ scroll"
         if self.tailer.enabled:
             footer += "  m messages/log"
-        screen.append(footer)
+
+        screen.append(f"{FOOTER_GRAY}{footer}{RESET}")
         clear = CLEAR_SCREEN if self.last_size != (rows, columns) else ""
         self.last_size = (rows, columns)
         rendered = "\n".join(f"{line}{CLEAR_LINE}" for line in screen)
