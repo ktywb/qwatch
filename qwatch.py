@@ -1168,9 +1168,12 @@ class QWatch:
     def process_lines(self, columns: int, maximum: int) -> list[str]:
         wide = columns >= 105
         if wide:
-            lines = ["PID     PPID    S   CPU%     RSS     VSZ    R/s    W/s  THR ELAPSED   PROCESS"]
+            header = "PID     PPID    S   CPU%     RSS     VSZ    R/s    W/s  THR ELAPSED   PROCESS"
         else:
-            lines = ["PID     PPID    S   CPU%     RSS   IO/s  THR ELAPSED   PROCESS"]
+            header = "PID     PPID    S   CPU%     RSS   IO/s  THR ELAPSED   PROCESS"
+
+        lines = [f"{BOLD}{BLUE}{header}{RESET}"]
+
         for row in self.proc_rows[:maximum]:
             if wide:
                 line = (f"{row.pid:<7d} {row.ppid:<7d} {row.state:<1} {row.cpu:6.1f} "
