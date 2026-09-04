@@ -74,14 +74,14 @@ TASK_LABELS = {
 }
 CORE_TASK_NAMES = set(TASK_LABELS.values()) | {"Flow", "Fitter (Partial)"}
 ADDITIONAL_TASK_SPECS = (
-    ("IP Generation", ("IP Generation", "IP Generation Tool")),
-    ("Support-Logic Generation", ("Support-Logic Generation",)),
-    ("Design Analysis", ("Design Analysis",)),
-    ("Analysis & Elaboration Lint", ("Analysis & Elaboration Lint",)),
-    ("Early Timing Analysis", ("Early Timing Analysis",)),
-    ("Power Analysis", ("Power Analysis", "Power Analyzer")),
-    ("EDA Netlist Writer", ("EDA Netlist Writer",)),
-    ("Simulation", ("Simulation",)),
+    ("IP GEN", ("IP Generation", "IP Generation Tool")),
+    ("SUPPORT-LOG", ("Support-Logic Generation",)),
+    ("DESIGN", ("Design Analysis",)),
+    ("A&E LINT", ("Analysis & Elaboration Lint",)),
+    ("EARLY STA", ("Early Timing Analysis",)),
+    ("POWER", ("Power Analysis", "Power Analyzer")),
+    ("EDA NETLIST", ("EDA Netlist Writer",)),
+    ("SIM", ("Simulation",)),
 )
 ADDITIONAL_TASK_NAMES = {
     name for _, aliases in ADDITIONAL_TASK_SPECS for name in aliases
@@ -936,6 +936,7 @@ class QWatch:
         self.session_run_name = ""
         self.paused = False
         self.message_mode = True
+        self.task_panel = "main"
         self.tick = 0
         self.last_size: tuple[int, int] | None = None
         self.last_error = ""
@@ -1209,7 +1210,7 @@ class QWatch:
         unknown = [task for task in current
                    if task.name not in CORE_TASK_NAMES
                    and task.name not in ADDITIONAL_TASK_NAMES]
-        entries.extend((task.name, task) for task in sorted(
+        entries.extend((task.name.upper(), task) for task in sorted(
             unknown, key=lambda task: (task.start_time, task.id)
         ))
         return entries
@@ -1295,7 +1296,6 @@ class QWatch:
         rows, columns = size.lines, size.columns
         compact = rows < 34
         process_max = 2 if compact else 5
-        width = self.bar_width(columns)
         heartbeat = "■" if self.tick % 2 else "□"
         mode = "PAUSED" if self.paused else "LIVE"
         mode_color = YELLOW if self.paused else GREEN
@@ -1307,49 +1307,67 @@ class QWatch:
         screen.extend(self.process_lines(columns, process_max))
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Compilation{RESET}"))
-        header = self.table_header(width)
+
+        stage_width = 12
+        gap = 3
+        minimum_bar_width = 8
+        maximum_bar_width = 30
+        # Each table uses stage + progress + 27 printable columns.  Share the
+        # remaining space between both progress bars when two tables fit.
+        available_bar_width = columns - 1 - gap - 2 * (stage_width + 27)
+        show_both_panels = available_bar_width >= 2 * minimum_bar_width
+        if show_both_panels:
+            main_width = min(maximum_bar_width, available_bar_width // 2)
+            additional_width = min(maximum_bar_width,
+                                   available_bar_width - main_width)
+        else:
+            main_width = additional_width = self.bar_width(columns)
+
         qsys_status, qsys_elapsed = self.qsys_snapshot
         core_lines = [
-            self.row("QSYS", "-", "-", qsys_status, qsys_elapsed, width),
-            self.parent_task_line("A&S", "a_s", width),
-            self.task_line("ELAB", "elab", width, "  "),
-            self.task_line("SYN", "syn", width, "  "),
-            self.parent_task_line("FIT", "fitter", width),
+            self.row("QSYS", "-", "-", qsys_status, qsys_elapsed, main_width),
+            self.parent_task_line("A&S", "a_s", main_width),
+            self.task_line("ELAB", "elab", main_width, "  "),
+            self.task_line("SYN", "syn", main_width, "  "),
+            self.parent_task_line("FIT", "fitter", main_width),
         ]
         for label, key in (("PLAN", "plan"), ("PLACE", "place"), ("ROUTE", "route"),
                            ("FAST-FWD", "fast"), ("RETIME", "retime"), ("FINALIZE", "finalize")):
-            core_lines.append(self.task_line(label, key, width, "  "))
-        core_lines.extend((self.task_line("ASM", "asm", width),
-                           self.task_line("STA", "sta", width)))
+            core_lines.append(self.task_line(label, key, main_width, "  "))
+        core_lines.extend((self.task_line("ASM", "asm", main_width),
+                           self.task_line("STA", "sta", main_width)))
 
         additional = self.additional_task_entries()
-        core_table_width = max(
-            [len(header), *(len(ANSI_RE.sub("", line)) for line in core_lines)]
-        )
-        gap = 3
-        extra_width = 12
-        # A rendered row needs 27 columns beyond its stage and bar widths.
-        available_stage_width = columns - 1 - core_table_width - gap - extra_width - 27
-        wanted_stage_width = min(
-            32, max([18, *(len(label) for label, _ in additional)])
-        )
-        show_additional = available_stage_width >= wanted_stage_width
-        if show_additional:
-            extra_stage_width = wanted_stage_width
-            extra_header = self.table_header(extra_width, extra_stage_width,
-                                             "Additional task")
-            screen.append(f"{BOLD}{BLUE}{pad_ansi(header, core_table_width)}"
-                          f"{' ' * gap}{extra_header}{RESET}")
+        additional_lines = [
+            self.task_record_line(label, task, additional_width, stage_width)
+            for label, task in additional
+        ]
+        if show_both_panels:
+            main_header = self.table_header(main_width, stage_width, "Main task")
+            additional_header = self.table_header(additional_width, stage_width,
+                                                  "Additional")
+            main_table_width = stage_width + main_width + 27
+            screen.append(f"{BOLD}{BLUE}{pad_ansi(main_header, main_table_width)}"
+                          f"{' ' * gap}{additional_header}{RESET}")
             for index in range(max(len(core_lines), len(additional))):
                 left = core_lines[index] if index < len(core_lines) else ""
-                right = (self.task_record_line(additional[index][0], additional[index][1],
-                                               extra_width, extra_stage_width)
-                         if index < len(additional) else "")
-                screen.append(f"{pad_ansi(left, core_table_width)}{' ' * gap}{right}")
+                right = additional_lines[index] if index < len(additional_lines) else ""
+                screen.append(f"{pad_ansi(left, main_table_width)}{' ' * gap}{right}")
+            total_width = main_width
+        elif self.task_panel == "additional":
+            screen.append(f"{BOLD}{BLUE}"
+                          f"{self.table_header(additional_width, stage_width, 'Additional')}"
+                          f"{RESET}")
+            screen.extend(additional_lines)
+            total_width = additional_width
         else:
-            screen.append(f"{BOLD}{BLUE}{header}{RESET}")
+            screen.append(f"{BOLD}{BLUE}"
+                          f"{self.table_header(main_width, stage_width, 'Main task')}"
+                          f"{RESET}")
             screen.extend(core_lines)
-        screen.append(f"{BOLD}{'Total : ' :>{31 + width}}{elapsed_text(self.total_elapsed())}{RESET}")
+            total_width = main_width
+        screen.append(f"{BOLD}{'Total : ' :>{31 + total_width}}"
+                      f"{elapsed_text(self.total_elapsed())}{RESET}")
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Events{RESET}"))
             event_lines = list(self.events.events)[-2:] or ["(no new checkpoint/report events)"]
@@ -1371,6 +1389,8 @@ class QWatch:
         if not compact:
             screen.append("")
         footer = "q/Ctrl-C exit  Space pause  +/- rate  ↑/↓ scroll"
+        if not show_both_panels:
+            footer += "  ←/→ tasks"
         if self.tailer.enabled:
             footer += "  m messages/log"
 
@@ -1397,6 +1417,12 @@ class QWatch:
                     redraw = True
                 elif sequence == b"\x1b[B":
                     source.view_offset = max(0, source.view_offset - 1)
+                    redraw = True
+                elif sequence == b"\x1b[C":
+                    self.task_panel = "additional"
+                    redraw = True
+                elif sequence == b"\x1b[D":
+                    self.task_panel = "main"
                     redraw = True
                 continue
             key, self.input_buffer = self.input_buffer[:1], self.input_buffer[1:]

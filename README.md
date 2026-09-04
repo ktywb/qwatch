@@ -78,6 +78,8 @@ While `qwatch` is running:
 | `-`      | Lengthen the sampling interval                                  |
 | `Up`     | Scroll messages or the build log up                             |
 | `Down`   | Scroll messages or the build log down                           |
+| `Left`   | Show the main task panel when two panels do not fit              |
+| `Right`  | Show the additional task panel when two panels do not fit        |
 | `m`      | Switch between Quartus messages and the optional build-log view |
 
 The sampling interval is clamped between 0.2 and 10 seconds.
@@ -246,24 +248,28 @@ Fitter (Finalize)
 
 Assembler and Timing Analyzer are displayed as separate top-level stages.
 
-When the terminal is wide enough, a second compilation panel displays the
+When the terminal can fit two minimum-width task tables (about 98 columns), the
+main and additional panels are displayed side by side. Both progress-bar widths
+grow with the available terminal width up to 30 columns. On narrower terminals,
+use `Left` and `Right` to switch between the main and additional panels.
+
+The additional panel uses short labels matching the main panel's style for the
 optional task slots defined by Quartus Prime Pro 25.1 Full Compilation:
 
 ```text
-IP Generation
-Support-Logic Generation
-Design Analysis
-Analysis & Elaboration Lint
-Early Timing Analysis
-Power Analysis
-EDA Netlist Writer
-Simulation
+IP GEN
+SUPPORT-LOG
+DESIGN
+A&E LINT
+EARLY STA
+POWER
+EDA NETLIST
+SIM
 ```
 
 A `-` status means Quartus did not report that task for the selected run. Any
 unrecognized current-session `runlog.db` tasks are appended after these slots,
-so version-specific tasks remain visible. The additional panel appears at
-roughly 140 columns; the exact threshold grows for longer task names.
+so version-specific tasks remain visible.
 
 For running child stages, elapsed time is calculated from the task-local
 `start_time`. This avoids using cumulative Fitter elapsed time for child rows
