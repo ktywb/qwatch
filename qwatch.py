@@ -72,6 +72,7 @@ TASK_LABELS = {
     "asm": "Assembler",
     "sta": "Timing Analysis (Finalize)",
 }
+CORE_TASK_NAMES = set(TASK_LABELS.values()) | {"Flow", "Fitter (Partial)"}
 GENERATION_DRIVERS = {"quartus_syn", "quartus_map"}
 
 
@@ -132,6 +133,12 @@ def clip(text: str, columns: int) -> str:
     """Trim printable text to the terminal width without ANSI state."""
     clean = ANSI_RE.sub("", text).replace("\r", "")
     return clean[: max(1, columns - 1)]
+
+
+def pad_ansi(text: str, width: int) -> str:
+    """Pad a colored terminal line to a printable width."""
+    printable = len(ANSI_RE.sub("", text))
+    return text + " " * max(0, width - printable)
 
 
 def scaled_bytes(value: float) -> str:
@@ -1080,6 +1087,10 @@ class QWatch:
         task = self.task(key)
         if task is None:
             return "", None, -1
+        return task.status, task.percent, self.task_elapsed(task)
+
+    @staticmethod
+    def task_elapsed(task: Task) -> int:
         if task.status == "running" and task.start_time:
             # Fitter child rows report cumulative Fitter elapsed_time while
             # running.  Their own start_time is the stage-local boundary.
@@ -1090,7 +1101,7 @@ class QWatch:
             elapsed = -1
         else:
             elapsed = task.elapsed_time if task.elapsed_time > 0 else -1
-        return task.status, task.percent, elapsed
+        return elapsed
 
     def total_elapsed(self) -> int:
         if not self.session_start:
@@ -1152,18 +1163,51 @@ class QWatch:
                             status, elapsed, width)
         return self.row(label, "-", "-", status, elapsed, width)
 
+    def task_record_line(self, task: Task, width: int, stage_width: int) -> str:
+        """Render an arbitrary runlog task without a version-specific mapping."""
+        name = task.name
+        if len(name) > stage_width:
+            name = name[:stage_width - 1] + "…"
+        status = task.status
+        elapsed = self.task_elapsed(task)
+        if status == "running" and task.percent <= 0:
+            return self.row(name, progress_bar(None, width, self.tick, True), "-",
+                            status, elapsed, width, stage_width)
+        if status == "done":
+            return self.row(name, progress_bar(100, width, self.tick, False),
+                            "100", status, elapsed, width, stage_width)
+        percent = max(0, min(100, task.percent))
+        return self.row(name, progress_bar(percent, width, self.tick, False),
+                        f"{percent:3d}", status, elapsed, width, stage_width)
+
+    def additional_tasks(self) -> list[Task]:
+        """Return Quartus tasks not represented by the fixed core flow tree."""
+        tasks = [task for task in self.session_rows() if task.name not in CORE_TASK_NAMES]
+        return sorted(tasks, key=lambda task: (task.start_time, task.id))
+
+    @staticmethod
+    def table_header(width: int, stage_width: int = 12,
+                     title: str = "Stage") -> str:
+        return (
+            f"{title:<{stage_width}} "
+            f"{'Progress':<{width}}"
+            f"  {'%':>3}   "
+            f"{'Status':<8}  "
+            f"Elapsed"
+        )
+
     @staticmethod
     def row(stage: str, progress: str, percent: str,
-            status: str, elapsed: int, width: int) -> str:
-            visible_len = len(ANSI_RE.sub("", progress))
-            progress_pad = " " * max(0, width - visible_len)
-            return (
-                f"{stage:<12} "
-                f"{progress}{progress_pad}"
-                f"  {percent:>3}   "
-                f"{color_status(status)}  "
-                f"{elapsed_text(elapsed)}"
-            )
+            status: str, elapsed: int, width: int, stage_width: int = 12) -> str:
+        visible_len = len(ANSI_RE.sub("", progress))
+        progress_pad = " " * max(0, width - visible_len)
+        return (
+            f"{stage:<{stage_width}} "
+            f"{progress}{progress_pad}"
+            f"  {percent:>3}   "
+            f"{color_status(status)}  "
+            f"{elapsed_text(elapsed)}"
+        )
 
     def process_lines(self, columns: int, maximum: int) -> list[str]:
         wide = columns >= 105
@@ -1234,25 +1278,45 @@ class QWatch:
         screen.extend(self.process_lines(columns, process_max))
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Compilation{RESET}"))
-        header = (
-                    f"{'Stage':<12} "
-                    f"{'Progress':<{width}}"
-                    f"  {'%':>3}   "
-                    f"{'Status':<8}  "
-                    f"Elapsed"
-                )
-        screen.append(f"{BOLD}{BLUE}{header}{RESET}")
+        header = self.table_header(width)
         qsys_status, qsys_elapsed = self.qsys_snapshot
-        screen.append(self.row("QSYS", "-", "-", qsys_status, qsys_elapsed, width))
-        screen.append(self.parent_task_line("A&S", "a_s", width))
-        screen.append(self.task_line("ELAB", "elab", width, "  "))
-        screen.append(self.task_line("SYN", "syn", width, "  "))
-        screen.append(self.parent_task_line("FIT", "fitter", width))
+        core_lines = [
+            self.row("QSYS", "-", "-", qsys_status, qsys_elapsed, width),
+            self.parent_task_line("A&S", "a_s", width),
+            self.task_line("ELAB", "elab", width, "  "),
+            self.task_line("SYN", "syn", width, "  "),
+            self.parent_task_line("FIT", "fitter", width),
+        ]
         for label, key in (("PLAN", "plan"), ("PLACE", "place"), ("ROUTE", "route"),
                            ("FAST-FWD", "fast"), ("RETIME", "retime"), ("FINALIZE", "finalize")):
-            screen.append(self.task_line(label, key, width, "  "))
-        screen.append(self.task_line("ASM", "asm", width))
-        screen.append(self.task_line("STA", "sta", width))
+            core_lines.append(self.task_line(label, key, width, "  "))
+        core_lines.extend((self.task_line("ASM", "asm", width),
+                           self.task_line("STA", "sta", width)))
+
+        additional = self.additional_tasks()
+        core_table_width = max(len(header), *(len(ANSI_RE.sub("", line))
+                                              for line in core_lines))
+        gap = 3
+        extra_width = 12
+        # A rendered row needs 27 columns beyond its stage and bar widths.
+        available_stage_width = columns - 1 - core_table_width - gap - extra_width - 27
+        wanted_stage_width = min(28, max(18, *(len(task.name) for task in additional)))
+        show_additional = bool(additional) and available_stage_width >= wanted_stage_width
+        if show_additional:
+            extra_stage_width = wanted_stage_width
+            extra_header = self.table_header(extra_width, extra_stage_width,
+                                             "Additional task")
+            screen.append(f"{BOLD}{BLUE}{pad_ansi(header, core_table_width)}"
+                          f"{' ' * gap}{extra_header}{RESET}")
+            for index in range(max(len(core_lines), len(additional))):
+                left = core_lines[index] if index < len(core_lines) else ""
+                right = (self.task_record_line(additional[index], extra_width,
+                                               extra_stage_width)
+                         if index < len(additional) else "")
+                screen.append(f"{pad_ansi(left, core_table_width)}{' ' * gap}{right}")
+        else:
+            screen.append(f"{BOLD}{BLUE}{header}{RESET}")
+            screen.extend(core_lines)
         screen.append(f"{BOLD}{'Total : ' :>{31 + width}}{elapsed_text(self.total_elapsed())}{RESET}")
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Events{RESET}"))
