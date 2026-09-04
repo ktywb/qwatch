@@ -1294,13 +1294,16 @@ class QWatch:
                            self.task_line("STA", "sta", width)))
 
         additional = self.additional_tasks()
-        core_table_width = max(len(header), *(len(ANSI_RE.sub("", line))
-                                              for line in core_lines))
+        core_table_width = max(
+            [len(header), *(len(ANSI_RE.sub("", line)) for line in core_lines)]
+        )
         gap = 3
         extra_width = 12
         # A rendered row needs 27 columns beyond its stage and bar widths.
         available_stage_width = columns - 1 - core_table_width - gap - extra_width - 27
-        wanted_stage_width = min(28, max(18, *(len(task.name) for task in additional)))
+        wanted_stage_width = min(
+            28, max([18, *(len(task.name) for task in additional)])
+        )
         show_additional = bool(additional) and available_stage_width >= wanted_stage_width
         if show_additional:
             extra_stage_width = wanted_stage_width
