@@ -246,11 +246,8 @@ Fitter (Finalize)
 
 Assembler and Timing Analyzer are displayed as separate top-level stages.
 
-When the terminal is wide enough, a second compilation panel displays every
-current-session `runlog.db` task not represented by the core tree. It is driven
-by the database contents rather than a fixed compatibility list, so optional
-and version-specific tasks remain visible. Quartus Prime Pro 25.1 Full
-Compilation definitions include tasks such as:
+When the terminal is wide enough, a second compilation panel displays the
+optional task slots defined by Quartus Prime Pro 25.1 Full Compilation:
 
 ```text
 IP Generation
@@ -263,8 +260,10 @@ EDA Netlist Writer
 Simulation
 ```
 
-Only tasks present in the selected run are shown. The additional panel appears
-at roughly 140 columns; the exact threshold grows for longer task names.
+A `-` status means Quartus did not report that task for the selected run. Any
+unrecognized current-session `runlog.db` tasks are appended after these slots,
+so version-specific tasks remain visible. The additional panel appears at
+roughly 140 columns; the exact threshold grows for longer task names.
 
 For running child stages, elapsed time is calculated from the task-local
 `start_time`. This avoids using cumulative Fitter elapsed time for child rows

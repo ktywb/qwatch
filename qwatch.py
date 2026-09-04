@@ -73,6 +73,19 @@ TASK_LABELS = {
     "sta": "Timing Analysis (Finalize)",
 }
 CORE_TASK_NAMES = set(TASK_LABELS.values()) | {"Flow", "Fitter (Partial)"}
+ADDITIONAL_TASK_SPECS = (
+    ("IP Generation", ("IP Generation", "IP Generation Tool")),
+    ("Support-Logic Generation", ("Support-Logic Generation",)),
+    ("Design Analysis", ("Design Analysis",)),
+    ("Analysis & Elaboration Lint", ("Analysis & Elaboration Lint",)),
+    ("Early Timing Analysis", ("Early Timing Analysis",)),
+    ("Power Analysis", ("Power Analysis", "Power Analyzer")),
+    ("EDA Netlist Writer", ("EDA Netlist Writer",)),
+    ("Simulation", ("Simulation",)),
+)
+ADDITIONAL_TASK_NAMES = {
+    name for _, aliases in ADDITIONAL_TASK_SPECS for name in aliases
+}
 GENERATION_DRIVERS = {"quartus_syn", "quartus_map"}
 
 
@@ -1163,11 +1176,14 @@ class QWatch:
                             status, elapsed, width)
         return self.row(label, "-", "-", status, elapsed, width)
 
-    def task_record_line(self, task: Task, width: int, stage_width: int) -> str:
+    def task_record_line(self, label: str, task: Task | None,
+                         width: int, stage_width: int) -> str:
         """Render an arbitrary runlog task without a version-specific mapping."""
-        name = task.name
+        name = label
         if len(name) > stage_width:
             name = name[:stage_width - 1] + "…"
+        if task is None:
+            return self.row(name, "-", "-", "", -1, width, stage_width)
         status = task.status
         elapsed = self.task_elapsed(task)
         if status == "running" and task.percent <= 0:
@@ -1180,10 +1196,23 @@ class QWatch:
         return self.row(name, progress_bar(percent, width, self.tick, False),
                         f"{percent:3d}", status, elapsed, width, stage_width)
 
-    def additional_tasks(self) -> list[Task]:
-        """Return Quartus tasks not represented by the fixed core flow tree."""
-        tasks = [task for task in self.session_rows() if task.name not in CORE_TASK_NAMES]
-        return sorted(tasks, key=lambda task: (task.start_time, task.id))
+    def additional_task_entries(self) -> list[tuple[str, Task | None]]:
+        """Return fixed optional slots followed by unrecognized runlog tasks."""
+        current = self.session_rows()
+        entries: list[tuple[str, Task | None]] = []
+        for label, aliases in ADDITIONAL_TASK_SPECS:
+            matches = [task for task in current if task.name in aliases]
+            selected = max(matches, key=lambda task: (task.start_time,
+                                                       task.last_updated,
+                                                       task.id), default=None)
+            entries.append((label, selected))
+        unknown = [task for task in current
+                   if task.name not in CORE_TASK_NAMES
+                   and task.name not in ADDITIONAL_TASK_NAMES]
+        entries.extend((task.name, task) for task in sorted(
+            unknown, key=lambda task: (task.start_time, task.id)
+        ))
+        return entries
 
     @staticmethod
     def table_header(width: int, stage_width: int = 12,
@@ -1293,7 +1322,7 @@ class QWatch:
         core_lines.extend((self.task_line("ASM", "asm", width),
                            self.task_line("STA", "sta", width)))
 
-        additional = self.additional_tasks()
+        additional = self.additional_task_entries()
         core_table_width = max(
             [len(header), *(len(ANSI_RE.sub("", line)) for line in core_lines)]
         )
@@ -1302,9 +1331,9 @@ class QWatch:
         # A rendered row needs 27 columns beyond its stage and bar widths.
         available_stage_width = columns - 1 - core_table_width - gap - extra_width - 27
         wanted_stage_width = min(
-            28, max([18, *(len(task.name) for task in additional)])
+            32, max([18, *(len(label) for label, _ in additional)])
         )
-        show_additional = bool(additional) and available_stage_width >= wanted_stage_width
+        show_additional = available_stage_width >= wanted_stage_width
         if show_additional:
             extra_stage_width = wanted_stage_width
             extra_header = self.table_header(extra_width, extra_stage_width,
@@ -1313,8 +1342,8 @@ class QWatch:
                           f"{' ' * gap}{extra_header}{RESET}")
             for index in range(max(len(core_lines), len(additional))):
                 left = core_lines[index] if index < len(core_lines) else ""
-                right = (self.task_record_line(additional[index], extra_width,
-                                               extra_stage_width)
+                right = (self.task_record_line(additional[index][0], additional[index][1],
+                                               extra_width, extra_stage_width)
                          if index < len(additional) else "")
                 screen.append(f"{pad_ansi(left, core_table_width)}{' ' * gap}{right}")
         else:
