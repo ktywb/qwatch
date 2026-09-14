@@ -1155,6 +1155,36 @@ class QWatch:
     def bar_width(columns: int) -> int:
         return max(8, min(30, columns - 44))
 
+    @staticmethod
+    def task_panel_layout(columns: int) -> tuple[bool, int, int, int]:
+        """Size the two task panels, consuming their gutter before their bars."""
+        stage_width = 12
+        table_fixed_width = stage_width + 27
+        minimum_bar_width = 8
+        maximum_bar_width = 30
+        minimum_gap = 3
+        preferred_gap = 10
+
+        # Leave one column unused so an exact-width line cannot wrap on terminals
+        # whose last cell has special cursor behavior.
+        flexible_width = columns - 1 - 2 * table_fixed_width
+        show_both = flexible_width >= 2 * minimum_bar_width + minimum_gap
+        if not show_both:
+            width = QWatch.bar_width(columns)
+            return False, width, width, 0
+
+        # At full bar width, assign spare columns to the gutter first.  When the
+        # terminal narrows this makes the gutter shrink to minimum_gap before
+        # either progress bar loses width.
+        gap = min(preferred_gap, max(
+            minimum_gap,
+            flexible_width - 2 * maximum_bar_width,
+        ))
+        bar_space = flexible_width - gap
+        main_width = min(maximum_bar_width, bar_space // 2)
+        additional_width = min(maximum_bar_width, bar_space - main_width)
+        return True, main_width, additional_width, gap
+
     def task_line(self, label: str, key: str, width: int, indent: str = "") -> str:
         status, percent, elapsed = self.task_status(key)
         if not status:
@@ -1309,19 +1339,8 @@ class QWatch:
             screen.extend(("", f"{BOLD}{BLUE}Compilation{RESET}"))
 
         stage_width = 12
-        gap = 3
-        minimum_bar_width = 8
-        maximum_bar_width = 30
-        # Each table uses stage + progress + 27 printable columns.  Share the
-        # remaining space between both progress bars when two tables fit.
-        available_bar_width = columns - 1 - gap - 2 * (stage_width + 27)
-        show_both_panels = available_bar_width >= 2 * minimum_bar_width
-        if show_both_panels:
-            main_width = min(maximum_bar_width, available_bar_width // 2)
-            additional_width = min(maximum_bar_width,
-                                   available_bar_width - main_width)
-        else:
-            main_width = additional_width = self.bar_width(columns)
+        show_both_panels, main_width, additional_width, gap = \
+            self.task_panel_layout(columns)
 
         qsys_status, qsys_elapsed = self.qsys_snapshot
         core_lines = [

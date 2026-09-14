@@ -250,8 +250,11 @@ Assembler and Timing Analyzer are displayed as separate top-level stages.
 
 When the terminal can fit two minimum-width task tables (about 98 columns), the
 main and additional panels are displayed side by side. Both progress-bar widths
-grow with the available terminal width up to 30 columns. On narrower terminals,
-use `Left` and `Right` to switch between the main and additional panels.
+grow with the available terminal width up to 30 columns. Wide layouts use an
+eight-column gutter between the panels. As the terminal narrows, that gutter is
+reduced to three columns before either progress bar is shortened. On narrower
+terminals, use `Left` and `Right` to switch between the main and additional
+panels.
 
 The additional panel uses short labels matching the main panel's style for the
 optional task slots defined by Quartus Prime Pro 25.1 Full Compilation:
