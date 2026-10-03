@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import select
@@ -108,6 +109,29 @@ class Task:
     errors: int
     critical_warnings: int
     hostname: str
+
+
+@dataclass(frozen=True)
+class ReportSummary:
+    resource_source: str = ""
+    alms: str = ""
+    registers: str = ""
+    ram_blocks: str = ""
+    dsp_blocks: str = ""
+    setup_wns: float | None = None
+    worst_clock_tns: float | None = None
+    setup_clock: str = ""
+    setup_corner: str = ""
+    hold_wns: float | None = None
+
+
+@dataclass(frozen=True)
+class TimingDetails:
+    setup_wns: float | None = None
+    worst_clock_tns: float | None = None
+    setup_clock: str = ""
+    setup_corner: str = ""
+    hold_wns: float | None = None
 
 
 @dataclass(frozen=True)
@@ -725,6 +749,187 @@ class EventWatcher:
         self.initialized = True
 
 
+class QuartusReportReader:
+    """Read current-generation metrics from native Quartus reports only."""
+
+    RESOURCE_FIELDS = {
+        "Logic utilization (in ALMs)": "alms",
+        "Logic utilization estimate (in ALMs)": "alms",
+        "Total dedicated logic registers": "registers",
+        "Total RAM Blocks": "ram_blocks",
+        "Total DSP Blocks": "dsp_blocks",
+        "Estimated DSP Blocks Post-Merging": "dsp_blocks",
+    }
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.cache: dict[Path, tuple[tuple[int, int], object]] = {}
+
+    def current_path(self, revision: str, suffix: str, start: int,
+                     end: int) -> Path | None:
+        candidates: list[tuple[float, Path]] = []
+        for directory in (self.root, self.root / "output_files"):
+            path = directory / f"{revision}.{suffix}"
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified >= start - 2 and (end <= 0 or modified <= end + 120):
+                candidates.append((modified, path))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    def cached(self, path: Path, parser: object) -> object:
+        stamp = path.stat()
+        identity = (stamp.st_mtime_ns, stamp.st_size)
+        saved = self.cache.get(path)
+        if saved is not None and saved[0] == identity:
+            return saved[1]
+        result = parser(path)
+        self.cache[path] = (identity, result)
+        return result
+
+    @classmethod
+    def parse_resources(cls, path: Path) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        with path.open(encoding="utf-8", errors="replace") as report:
+            for index, line in enumerate(report):
+                if index >= 800:
+                    break
+                if line.lstrip().startswith(";"):
+                    cells = [cell.strip() for cell in line.split(";")]
+                    if len(cells) < 3:
+                        continue
+                    label, value = cells[1:3]
+                elif ":" in line:
+                    label, value = (part.strip() for part in line.split(":", 1))
+                else:
+                    continue
+                if label in {"Fitter Status", "Synthesis Status"}:
+                    fields["status"] = value
+                field = cls.RESOURCE_FIELDS.get(label)
+                if field is not None and field not in fields:
+                    fields[field] = " ".join(value.split())
+        return fields
+
+    @staticmethod
+    def parse_timing(path: Path) -> TimingDetails:
+        timing_rows: dict[str, list[tuple[str, float, float | None, str]]] = {
+            "Setup": [], "Hold": [],
+        }
+        row_kind = ""
+        row_clock = ""
+        row_corner = ""
+        slack: float | None = None
+        tns: float | None = None
+        table_kind = ""
+        table_header = False
+        table_has_rows = False
+
+        def append_summary_row() -> None:
+            if row_kind and slack is not None:
+                timing_rows[row_kind].append((row_clock, slack, tns, row_corner))
+
+        with path.open(encoding="utf-8", errors="replace") as report:
+            for index, line in enumerate(report):
+                if index >= 4000:
+                    break
+                stripped = line.strip()
+                if stripped.startswith("Type") and ":" in stripped:
+                    append_summary_row()
+                    description = stripped.split(":", 1)[1].strip()
+                    match = re.match(r"(Setup|Hold)\s+'(.*)'", description)
+                    row_kind = match.group(1) if match else ""
+                    row_clock = match.group(2) if match else ""
+                    row_corner = ""
+                    slack = tns = None
+                    continue
+                if row_kind and ":" in stripped:
+                    label, value = (part.strip() for part in stripped.split(":", 1))
+                    if label == "Corner":
+                        row_corner = value
+                        continue
+                    try:
+                        number = float(value)
+                    except ValueError:
+                        continue
+                    if math.isfinite(number):
+                        if label == "Slack":
+                            slack = number
+                        elif label == "TNS":
+                            tns = number
+                if not stripped.startswith(";"):
+                    if table_header and table_has_rows and stripped.startswith("+"):
+                        table_kind = ""
+                        table_header = table_has_rows = False
+                    continue
+                cells = [cell.strip() for cell in stripped.split(";")[1:-1]]
+                if len(cells) == 1 and cells[0] in {"Setup Summary", "Hold Summary"}:
+                    table_kind = cells[0].split()[0]
+                    table_header = table_has_rows = False
+                elif table_kind and len(cells) >= 3 and cells[0] == "Clock" \
+                        and cells[1] == "Slack" and cells[2] == "End Point TNS":
+                    table_header = True
+                elif table_header and len(cells) >= 3:
+                    try:
+                        row_slack, row_tns = float(cells[1]), float(cells[2])
+                    except ValueError:
+                        continue
+                    if math.isfinite(row_slack) and math.isfinite(row_tns):
+                        corner = cells[4] if len(cells) > 4 else ""
+                        timing_rows[table_kind].append(
+                            (cells[0], row_slack, row_tns, corner)
+                        )
+                        table_has_rows = True
+        append_summary_row()
+        setup = min(timing_rows["Setup"], key=lambda row: row[1], default=None)
+        tns_values = [row[2] for row in timing_rows["Setup"] if row[2] is not None]
+        hold = min(timing_rows["Hold"], key=lambda row: row[1], default=None)
+        return TimingDetails(setup[1] if setup else None,
+                             min(tns_values, default=None),
+                             setup[0] if setup else "",
+                             setup[3] if setup else "",
+                             hold[1] if hold else None)
+
+    def read(self, revision: str, start: int, end: int) -> ReportSummary:
+        resources: dict[str, str] = {}
+        resource_source = ""
+        timing = TimingDetails()
+        for source, suffixes in (("FIT", ("fit.summary", "fit.rpt")),
+                                 ("SYN estimate", ("syn.summary", "syn.rpt"))):
+            for suffix in suffixes:
+                path = self.current_path(revision, suffix, start, end)
+                if path is None:
+                    continue
+                try:
+                    candidate = self.cached(path, self.parse_resources)
+                except OSError:
+                    continue
+                if not isinstance(candidate, dict) or not candidate.get("alms"):
+                    continue
+                if candidate.get("status", "").lower().startswith("successful"):
+                    resources, resource_source = candidate, source
+                    break
+            if resources:
+                break
+        for suffix in ("sta.summary", "sta.rpt"):
+            path = self.current_path(revision, suffix, start, end)
+            if path is None:
+                continue
+            try:
+                timing = self.cached(path, self.parse_timing)
+            except OSError:
+                continue
+            if timing.setup_wns is not None:
+                break
+        return ReportSummary(resource_source, resources.get("alms", ""),
+                             resources.get("registers", ""),
+                             resources.get("ram_blocks", ""),
+                             resources.get("dsp_blocks", ""),
+                             timing.setup_wns, timing.worst_clock_tns,
+                             timing.setup_clock, timing.setup_corner,
+                             timing.hold_wns)
+
+
 class ProcSampler:
     def __init__(self) -> None:
         self.previous: dict[int, tuple[int, int, int, float]] = {}
@@ -926,6 +1131,8 @@ class QWatch:
         self.tailer = LogTail(self.root, log, log_lines)
         self.messages = QMessageTail(self.root, log_lines)
         self.events = EventWatcher(self.root)
+        self.report_reader = QuartusReportReader(self.root)
+        self.report_summary = ReportSummary()
         self.procs = ProcSampler()
         self.rows: list[Task] = []
         self.proc_rows: list[ProcRow] = []
@@ -1001,6 +1208,7 @@ class QWatch:
         self.qsys_last_seen = 0.0
         self.qsys_final = -1
         self.qsys_snapshot = ("", -1)
+        self.report_summary = ReportSummary()
         self.messages.set_session(start_time, None)
         self.events.reset()
 
@@ -1095,6 +1303,18 @@ class QWatch:
         self.update_age = max(0, int(time.time()) - max(updates)) if updates else None
         heartbeat = self.reader.heartbeat_age(self.session_run_name)
         self.heartbeat_age = int(heartbeat) if heartbeat is not None else None
+        finished = self.completed_flow()
+        self.report_summary = ReportSummary()
+        if finished is not None and self.reader.path is not None:
+            try:
+                revision = self.reader.path.relative_to(
+                    self.root / "qdb" / "_compiler"
+                ).parts[0]
+                self.report_summary = self.report_reader.read(
+                    revision, self.session_start, finished.end_time,
+                )
+            except (ValueError, IndexError):
+                pass
         self.tick += 1
 
     def task_status(self, key: str) -> tuple[str, int | None, int]:
@@ -1128,6 +1348,98 @@ class QWatch:
         if any(row.status == "running" for row in current):
             end = int(time.time())
         return max(0, end - start)
+
+    def completed_flow(self) -> Task | None:
+        current = self.session_rows()
+        flows = [row for row in current if row.name == "Flow"]
+        flow = max(flows, key=lambda row: (row.start_time, row.id), default=None)
+        if any(row.status == "running" for row in current):
+            return None
+        terminal = {"done", "failed", "error", "aborted"}
+        if flow is not None:
+            return flow if flow.status in terminal else None
+
+        # Quartus Prime Pro may publish top-level tasks without a Flow row.
+        # Final STA is the last task of a full compile; completing Fitter alone
+        # is not sufficient because ASM and STA may start shortly afterward.
+        sta_rows = [row for row in current if row.name == TASK_LABELS["sta"]]
+        sta = max(sta_rows, key=lambda row: (row.start_time, row.id), default=None)
+        if sta is not None and sta.status in terminal:
+            return sta
+        failed = [row for row in current
+                  if row.status in {"failed", "error", "aborted"}
+                  or (row.status == "done" and not row.success)]
+        return max(failed, key=lambda row: (row.start_time, row.id), default=None)
+
+    def flow_succeeded(self, terminal: Task) -> bool:
+        return bool(terminal.status == "done" and terminal.success
+                    and all(row.status not in {"failed", "error", "aborted"}
+                            and (row.status != "done" or row.success)
+                            for row in self.session_rows()))
+
+    def summary_lines(self, flow: Task, columns: int,
+                      compact: bool = False) -> list[str]:
+        current = self.session_rows()
+        success = self.flow_succeeded(flow)
+        result = "SUCCESS" if success else "FAILED"
+        result_color = GREEN if success else RED
+        errors = max((int(row.errors or 0) for row in current), default=0)
+        critical = max((int(row.critical_warnings or 0) for row in current), default=0)
+        duration = elapsed_text(self.total_elapsed())
+        end_time = (time.strftime("%H:%M:%S", time.localtime(flow.end_time))
+                    if flow.end_time > 0 else "—")
+        result_line = (f"Result: {result}  Errors {errors}  Critical {critical}  "
+                       f"Total {duration}" if compact else
+                       f"Result: {result}  Total {duration}  Ended {end_time}")
+        lines = [f"{result_color}{clip(result_line, columns)}{RESET}"]
+        timing = self.report_summary
+        if not compact:
+            lines.append(f"Counts: Errors {errors}  Critical {critical}")
+        if timing.setup_wns is None:
+            lines.append("Timing: — (current-run STA report unavailable)")
+        else:
+            tns = (f"{timing.worst_clock_tns:+.3f} ns"
+                   if timing.worst_clock_tns is not None else "—")
+            if compact:
+                hold = (f"{timing.hold_wns:+.3f} ns" if timing.hold_wns is not None
+                        else "—")
+                lines.append(f"Timing: Setup {timing.setup_wns:+.3f} ns  "
+                             f"Hold {hold}  Worst TNS {tns}")
+            else:
+                lines.append(f"Setup: WNS {timing.setup_wns:+.3f} ns  "
+                             f"Worst clock TNS {tns}")
+                if timing.setup_clock:
+                    clock_line = f"  Worst setup clock: {timing.setup_clock}"
+                    corner = f"  ({timing.setup_corner})" if timing.setup_corner else ""
+                    lines.append(clock_line + corner if len(clock_line + corner) < columns
+                                 else clock_line)
+                if timing.hold_wns is not None:
+                    lines.append(f"Hold: WNS {timing.hold_wns:+.3f} ns")
+        if not timing.resource_source:
+            lines.append("Resources: — (current-run Fitter/Synthesis report unavailable)")
+        elif compact:
+            parts = []
+            for label, value in (("ALMs", timing.alms), ("Regs", timing.registers),
+                                 ("RAM", timing.ram_blocks), ("DSP", timing.dsp_blocks)):
+                match = re.search(r"\d[\d,]*", value)
+                if match:
+                    parts.append(f"{label} {match.group()}")
+            lines.append(f"Resources ({timing.resource_source}): " + "  ".join(parts))
+        else:
+            lines.append(f"Resources ({timing.resource_source}):")
+            for first, second in ((f"ALMs {timing.alms}",
+                                   f"Registers {timing.registers}" if timing.registers else ""),
+                                  (f"RAM {timing.ram_blocks}" if timing.ram_blocks else "",
+                                   f"DSP {timing.dsp_blocks}" if timing.dsp_blocks else "")):
+                if not first:
+                    if second:
+                        lines.append(f"  {second}")
+                elif second and len(f"  {first}    {second}") >= columns:
+                    lines.extend((f"  {first}", f"  {second}"))
+                else:
+                    lines.append(f"  {first}" + (f"    {second}" if second else ""))
+        return [line if ANSI_RE.search(line) else clip(line, columns)
+                for line in lines]
 
     def update_qsys_status(self, elapsed: int | None) -> None:
         now = time.time()
@@ -1298,6 +1610,12 @@ class QWatch:
         if self.pending_generation_start:
             detail = self.pending_generation_reason or "waiting for runlog"
             return f"{CYAN}{clip(f'Flow: PREPARING  {detail}', columns)}{RESET}"
+        finished = self.completed_flow()
+        if finished is not None:
+            success = self.flow_succeeded(finished)
+            result = "SUCCESS" if success else "FAILED"
+            color = GREEN if success else RED
+            return f"{color}{clip(f'Flow: {result}  run={finished.run_name}', columns)}{RESET}"
         running = [row for row in self.session_rows() if row.status == "running"]
         active = max(running, key=lambda row: (row.last_updated, row.start_time, row.id), default=None)
         if active is None:
@@ -1332,9 +1650,15 @@ class QWatch:
         # screen: list[str] = [f"{BOLD}{BLUE}{heartbeat} Quartus Monitor {mode_color}[{mode}]{RESET}  {self.project}  {self.interval:g}s"]
         screen: list[str] = [f"{BOLD}{BLUE}Quartus Monitor {mode_color}[{mode}]{RESET}  {self.project}  {self.interval:g}s"]
         screen.append(self.health_line(columns))
-        if not compact:
-            screen.extend(("", f"{BOLD}{BLUE}Processes{RESET}"))
-        screen.extend(self.process_lines(columns, process_max))
+        finished = self.completed_flow()
+        if finished is not None:
+            if not compact:
+                screen.extend(("", f"{BOLD}{BLUE}Summary{RESET}"))
+            screen.extend(self.summary_lines(finished, columns, compact))
+        else:
+            if not compact:
+                screen.extend(("", f"{BOLD}{BLUE}Processes{RESET}"))
+            screen.extend(self.process_lines(columns, process_max))
         if not compact:
             screen.extend(("", f"{BOLD}{BLUE}Compilation{RESET}"))
 
@@ -1387,7 +1711,7 @@ class QWatch:
             total_width = main_width
         screen.append(f"{BOLD}{'Total : ' :>{31 + total_width}}"
                       f"{elapsed_text(self.total_elapsed())}{RESET}")
-        if not compact:
+        if not compact and (finished is None or rows >= 40):
             screen.extend(("", f"{BOLD}{BLUE}Events{RESET}"))
             event_lines = list(self.events.events)[-2:] or ["(no new checkpoint/report events)"]
             screen.extend(clip(line, columns) for line in event_lines)

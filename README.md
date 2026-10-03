@@ -333,6 +333,42 @@ available.
 For report files, `qwatch` reports that the file changed. It does not parse the
 report contents or use report text to determine compilation state.
 
+## Completed Compilation Summary
+
+When the current `Flow` task reaches a terminal state in `runlog.db`, the
+Processes area becomes a Summary area. Some Quartus runs have no `Flow` row;
+for those, completed final Timing Analysis marks a full compile complete.
+A failed task can also show a failed Summary before final Timing Analysis.
+The health line shows `SUCCESS` or `FAILED`; the Summary shows errors,
+critical warnings, elapsed time, setup timing, and resources. The compilation
+table and messages remain visible. Completing Fitter or losing a process does
+not mark a full compilation as complete.
+
+The outcome and counts come from the current session's Quartus task records.
+For error and critical-warning counters, `qwatch` uses the largest recorded
+task value rather than summing parent and child rows, which may overlap.
+`SUCCESS` means Quartus finished the Flow successfully; it does not assert that
+all timing constraints passed.
+On terminals at least 34 rows high, the Summary separates the result, counts,
+setup timing, hold timing, and Fitter/Synthesis resources into labeled rows. It
+also identifies the clock and corner with the worst setup slack when available.
+On shorter terminals, these values are condensed to three lines. Below 40 rows,
+the completed Summary takes priority over the Events section so Messages remain
+visible.
+
+Timing uses the worst setup slack and the most negative per-clock endpoint TNS
+from current-run `<revision>.sta.summary`, falling back to the native
+`<revision>.sta.rpt` Setup Summary table. The TNS field is labeled *Worst clock
+TNS* because it is not a sum over all clocks. Hold WNS comes from the same
+native report's Hold section. Resources come from the native
+`<revision>.fit.summary` or its Fitter Summary report table. If neither exists,
+current-run synthesis results are shown as `SYN estimate`.
+
+Reports outside the current compilation's time window are ignored. Missing
+timing or resource metrics display `—`. A new compilation clears the previous
+Summary. On short terminals, resource values are condensed to used counts.
+`qwatch` does not read qclose collections or generated analysis data.
+
 ## Compilation Generations
 
 `qwatch` distinguishes successive compilations of the same project so that stale
