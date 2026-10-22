@@ -112,6 +112,14 @@ class Task:
 
 
 @dataclass(frozen=True)
+class ClockFmax:
+    clock: str
+    mhz: float | None
+    restricted_mhz: float | None
+    corner: str = ""
+
+
+@dataclass(frozen=True)
 class ReportSummary:
     resource_source: str = ""
     alms: str = ""
@@ -123,6 +131,7 @@ class ReportSummary:
     setup_clock: str = ""
     setup_corner: str = ""
     hold_wns: float | None = None
+    fmax: tuple[ClockFmax, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -763,7 +772,7 @@ class QuartusReportReader:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.cache: dict[Path, tuple[tuple[int, int], object]] = {}
+        self.cache: dict[tuple[Path, str], tuple[tuple[int, int], object]] = {}
 
     def current_path(self, revision: str, suffix: str, start: int,
                      end: int) -> Path | None:
@@ -781,11 +790,12 @@ class QuartusReportReader:
     def cached(self, path: Path, parser: object) -> object:
         stamp = path.stat()
         identity = (stamp.st_mtime_ns, stamp.st_size)
-        saved = self.cache.get(path)
+        key = (path, parser.__name__)
+        saved = self.cache.get(key)
         if saved is not None and saved[0] == identity:
             return saved[1]
         result = parser(path)
-        self.cache[path] = (identity, result)
+        self.cache[key] = (identity, result)
         return result
 
     @classmethod
@@ -890,6 +900,48 @@ class QuartusReportReader:
                              setup[3] if setup else "",
                              hold[1] if hold else None)
 
+    @staticmethod
+    def parse_fmax(path: Path) -> tuple[ClockFmax, ...]:
+        rows: list[ClockFmax] = []
+        in_panel = False
+        header: list[str] = []
+        table_has_rows = False
+
+        def frequency(value: str) -> float | None:
+            match = re.fullmatch(r"([\d.]+)\s*(MHz|GHz|kHz)", value, re.IGNORECASE)
+            if match is None:
+                return None
+            try:
+                number = float(match.group(1))
+            except ValueError:
+                return None
+            number *= {"mhz": 1.0, "ghz": 1000.0, "khz": 0.001}[match.group(2).lower()]
+            return number if math.isfinite(number) and number > 0 else None
+
+        with path.open(encoding="utf-8", errors="replace") as report:
+            for index, line in enumerate(report):
+                if index >= 4000:
+                    break
+                stripped = line.strip()
+                if not stripped.startswith(";"):
+                    if header and table_has_rows and stripped.startswith("+"):
+                        break
+                    continue
+                cells = [cell.strip() for cell in stripped.split(";")[1:-1]]
+                if cells == ["Fmax Summary"]:
+                    in_panel = True
+                elif in_panel and {"Fmax", "Restricted Fmax", "Clock Name"}.issubset(cells):
+                    header = cells
+                elif header and len(cells) == len(header):
+                    table_has_rows = True
+                    values = dict(zip(header, cells))
+                    mhz = frequency(values["Fmax"])
+                    restricted = frequency(values["Restricted Fmax"])
+                    if mhz is not None or restricted is not None:
+                        rows.append(ClockFmax(values["Clock Name"], mhz, restricted,
+                                              values.get("Worst-Case Operating Conditions", "")))
+        return tuple(rows)
+
     def read(self, revision: str, start: int, end: int) -> ReportSummary:
         resources: dict[str, str] = {}
         resource_source = ""
@@ -921,13 +973,22 @@ class QuartusReportReader:
                 continue
             if timing.setup_wns is not None:
                 break
+        fmax: tuple[ClockFmax, ...] = ()
+        # sta.summary has slack/TNS but not Fmax. Read the separate native
+        # report even when sta.summary already supplied the timing metrics.
+        path = self.current_path(revision, "sta.rpt", start, end)
+        if path is not None:
+            try:
+                fmax = self.cached(path, self.parse_fmax)
+            except OSError:
+                pass
         return ReportSummary(resource_source, resources.get("alms", ""),
                              resources.get("registers", ""),
                              resources.get("ram_blocks", ""),
                              resources.get("dsp_blocks", ""),
                              timing.setup_wns, timing.worst_clock_tns,
                              timing.setup_clock, timing.setup_corner,
-                             timing.hold_wns)
+                             timing.hold_wns, fmax)
 
 
 class ProcSampler:
@@ -1377,8 +1438,41 @@ class QWatch:
                             and (row.status != "done" or row.success)
                             for row in self.session_rows()))
 
+    def fmax_lines(self, columns: int, clock_rows: int = 1) -> list[str]:
+        timing = self.report_summary
+        clocks = sorted(timing.fmax, key=lambda row: row.clock != timing.setup_clock)
+        if not clocks:
+            return [clip("Fmax: — (current-run STA Fmax Summary unavailable)", columns)]
+
+        def frequency(value: float | None) -> str:
+            return f"{value:.2f}" if value is not None else "—"
+
+        primary = clocks[0]
+        if clock_rows <= 1:
+            identity = ("worst setup clock" if primary.clock == timing.setup_clock
+                        else f"clock {primary.clock}")
+            hidden = f"; +{len(clocks) - 1} clocks" if len(clocks) > 1 else ""
+            return [clip(f"Fmax: {frequency(primary.mhz)} MHz  "
+                         f"Restricted: {frequency(primary.restricted_mhz)} MHz  "
+                         f"({identity}{hidden})", columns)]
+
+        count = min(clock_rows, len(clocks))
+        corner_width = 24 if columns >= 120 else 0
+        clock_width = max(12, columns - 1 - 31 - corner_width)
+        corner_header = f"  {'Corner':<{corner_width - 2}}" if corner_width else ""
+        hidden = f" (+{len(clocks) - count} clocks)" if count < len(clocks) else ""
+        lines = [f"{BOLD}{BLUE}Fmax by clock{hidden}{RESET}",
+                 f"{'Clock':<{clock_width}} {'Fmax (MHz)':>12} {'Restricted (MHz)':>16}"
+                 + corner_header]
+        for row in clocks[:count]:
+            corner = f"  {clip(row.corner, corner_width - 2)}" if corner_width else ""
+            lines.append(f"{clip(row.clock, clock_width):<{clock_width}} "
+                         f"{frequency(row.mhz):>12} {frequency(row.restricted_mhz):>16}"
+                         + corner)
+        return lines
+
     def summary_lines(self, flow: Task, columns: int,
-                      compact: bool = False) -> list[str]:
+                      compact: bool = False, fmax_rows: int = 1) -> list[str]:
         current = self.session_rows()
         success = self.flow_succeeded(flow)
         result = "SUCCESS" if success else "FAILED"
@@ -1415,6 +1509,7 @@ class QWatch:
                                  else clock_line)
                 if timing.hold_wns is not None:
                     lines.append(f"Hold: WNS {timing.hold_wns:+.3f} ns")
+        lines.extend(self.fmax_lines(columns, fmax_rows))
         if not timing.resource_source:
             lines.append("Resources: — (current-run Fitter/Synthesis report unavailable)")
         elif compact:
@@ -1588,7 +1683,8 @@ class QWatch:
         else:
             header = "PID     PPID    S   CPU%     RSS   IO/s  THR ELAPSED   PROCESS"
 
-        lines = [f"{BOLD}{BLUE}{header}{RESET}"]
+        # lines = [f"{BOLD}{BLUE}{header}{RESET}"]
+        lines = [f"{BLUE}{header}{RESET}"]
 
         for row in self.proc_rows[:maximum]:
             if wide:
@@ -1651,16 +1747,23 @@ class QWatch:
         screen: list[str] = [f"{BOLD}{BLUE}Quartus Monitor {mode_color}[{mode}]{RESET}  {self.project}  {self.interval:g}s"]
         screen.append(self.health_line(columns))
         finished = self.completed_flow()
+        summary_start = len(screen)
+        summary_count = 0
         if finished is not None:
             if not compact:
                 screen.extend(("", f"{BOLD}{BLUE}Summary{RESET}"))
-            screen.extend(self.summary_lines(finished, columns, compact))
+            summary_start = len(screen)
+            summary = self.summary_lines(finished, columns, compact)
+            summary_count = len(summary)
+            screen.extend(summary)
         else:
             if not compact:
                 screen.extend(("", f"{BOLD}{BLUE}Processes{RESET}"))
             screen.extend(self.process_lines(columns, process_max))
         if not compact:
-            screen.extend(("", f"{BOLD}{BLUE}Compilation{RESET}"))
+            if finished is None:
+                screen.append("")
+            screen.append(f"{BOLD}{BLUE}Compilation{RESET}")
 
         stage_width = 12
         show_both_panels, main_width, additional_width, gap = \
@@ -1690,7 +1793,8 @@ class QWatch:
             additional_header = self.table_header(additional_width, stage_width,
                                                   "Additional")
             main_table_width = stage_width + main_width + 27
-            screen.append(f"{BOLD}{BLUE}{pad_ansi(main_header, main_table_width)}"
+            # screen.append(f"{BOLD}{BLUE}{pad_ansi(main_header, main_table_width)}"
+            screen.append(f"{BLUE}{pad_ansi(main_header, main_table_width)}"
                           f"{' ' * gap}{additional_header}{RESET}")
             for index in range(max(len(core_lines), len(additional))):
                 left = core_lines[index] if index < len(core_lines) else ""
@@ -1719,13 +1823,26 @@ class QWatch:
         source_label = (f"Messages ({self.messages.age_text()})"
                         if self.message_mode else "Log")
         source_path = source.display_path()
+        if finished is not None and not compact and len(self.report_summary.fmax) > 1:
+            # Expand clocks only into spare vertical space, retaining four
+            # message rows plus the source heading and footer. The two table
+            # headings replace the single compact Fmax line.
+            spare = rows - len(screen) - 8
+            clock_rows = min(len(self.report_summary.fmax), spare - 1)
+            if clock_rows >= 2:
+                screen[summary_start:summary_start + summary_count] = self.summary_lines(
+                    finished, columns, fmax_rows=clock_rows)
         if source.path is not None:
-            screen.extend(("", f"{BOLD}{BLUE}{clip(source_label + ': ' + source_path, columns)}{RESET}"))
+            if not (compact and finished is not None):
+                screen.append("")
+            screen.append(f"{BOLD}{BLUE}{clip(source_label + ': ' + source_path, columns)}{RESET}")
             count = max(1, min(source.line_count, rows - len(screen) - 2))
             screen.extend(source.lines(count, columns))
         elif source is self.messages:
             detail = self.messages.last_error or source_path
-            screen.extend(("", f"{BOLD}{BLUE}Messages: {clip(detail, columns)}{RESET}"))
+            if not (compact and finished is not None):
+                screen.append("")
+            screen.append(f"{BOLD}{BLUE}Messages: {clip(detail, columns)}{RESET}")
             screen.extend(self.messages.lines(1, columns))
         elif self.last_error:
             screen.extend(("", f"{RED}Status: {clip(self.last_error, columns)}{RESET}"))

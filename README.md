@@ -340,7 +340,7 @@ Processes area becomes a Summary area. Some Quartus runs have no `Flow` row;
 for those, completed final Timing Analysis marks a full compile complete.
 A failed task can also show a failed Summary before final Timing Analysis.
 The health line shows `SUCCESS` or `FAILED`; the Summary shows errors,
-critical warnings, elapsed time, setup timing, and resources. The compilation
+critical warnings, elapsed time, setup/hold timing, per-clock Fmax, and resources. The compilation
 table and messages remain visible. Completing Fitter or losing a process does
 not mark a full compilation as complete.
 
@@ -352,7 +352,7 @@ all timing constraints passed.
 On terminals at least 34 rows high, the Summary separates the result, counts,
 setup timing, hold timing, and Fitter/Synthesis resources into labeled rows. It
 also identifies the clock and corner with the worst setup slack when available.
-On shorter terminals, these values are condensed to three lines. Below 40 rows,
+On shorter terminals, these values are condensed to four lines. Below 40 rows,
 the completed Summary takes priority over the Events section so Messages remain
 visible.
 
@@ -364,10 +364,23 @@ native report's Hold section. Resources come from the native
 `<revision>.fit.summary` or its Fitter Summary report table. If neither exists,
 current-run synthesis results are shown as `SYN estimate`.
 
+Fmax comes only from the current-run `<revision>.sta.rpt` **Fmax Summary** table,
+even when slack/TNS are available in `.sta.summary`. Both Fmax and Restricted
+Fmax are displayed in MHz as reported by Quartus; neither is estimated from
+slack. With limited height, the worst Setup clock's Fmax is shown first, with a
+count of other clocks. If that clock has no Fmax row, the first reported clock
+is identified instead. Taller terminals expand a per-clock table, including
+the reported corner when width permits, while retaining space for Messages.
+Fmax is a same-clock metric, not a global design frequency or proof that all
+timing constraints (including cross-clock paths) passed. Missing Fmax data is
+shown as `—`, without substituting Restricted Fmax for Fmax.
+
 Reports outside the current compilation's time window are ignored. Missing
 timing or resource metrics display `—`. A new compilation clears the previous
 Summary. On short terminals, resource values are condensed to used counts.
 `qwatch` does not read qclose collections or generated analysis data.
+It does not invoke a timing analyzer, generate reports, or modify the build;
+summary extraction remains a read-only view of Quartus's native outputs.
 
 ## Compilation Generations
 
